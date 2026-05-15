@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.uv-cache/
+
+# Streamlit logs
+*.log
+streamlit.stdin.txt
+
+# Model files
+*.pt
+
+# IDE
+.idea/
+.vscode/
