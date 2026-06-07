@@ -44,6 +44,13 @@ MODEL_PATH = DATA_DIR / "best_model.pt"
 TRAINING_LOG_PATH = DATA_DIR / "training_logs.json"
 
 
+def get_dataset_dir(dataset: str) -> Path:
+    """根据数据集名称返回对应的子目录"""
+    if dataset == "mooc":
+        return DATA_DIR / "mooc"
+    return DATA_DIR / ("2017" if dataset == "2017" else "2009")
+
+
 def set_seed(seed: int = 42) -> None:
     """固定随机种子，保证实验可复现"""
     random.seed(seed)
@@ -83,12 +90,17 @@ def collate_batch(batch, max_seq_len: int = 200):
     """
     将批次数据打包为 tensor
 
+    支持两种序列格式:
+      - ASSISTments (5-tuple): (kc_id, correct, delta_t, hint, attempt)
+      - MOOC (7-tuple): (kc_id, correct, delta_t, hint, attempt, watch_ratio, is_replay)
+
     Args:
         batch: list of (student_id, seq)
         max_seq_len: 最大序列长度，超长截断
 
     Returns:
         dict: 包含所有特征的 batch dict
+              5-tuple 格式不含 watch_ratios / is_replays
     """
     # 截断超长序列
     batch = [
@@ -100,6 +112,9 @@ def collate_batch(batch, max_seq_len: int = 200):
     max_len = max(len(seq) for seq in seqs)
     batch_size = len(seqs)
 
+    # 检测序列格式: 取第一条记录的长度
+    has_video = len(seqs[0][0]) >= 7
+
     sequences = torch.zeros(batch_size, max_len, 2, dtype=torch.float32)
     corrects = torch.zeros(batch_size, max_len, dtype=torch.float32)
     delta_ts = torch.zeros(batch_size, max_len, dtype=torch.float32)
@@ -107,8 +122,13 @@ def collate_batch(batch, max_seq_len: int = 200):
     attempts = torch.zeros(batch_size, max_len, dtype=torch.float32)
     mask = torch.zeros(batch_size, max_len, dtype=torch.bool)
 
+    if has_video:
+        watch_ratios = torch.zeros(batch_size, max_len, dtype=torch.float32)
+        is_replays = torch.zeros(batch_size, max_len, dtype=torch.float32)
+
     for i, seq in enumerate(seqs):
-        for t, (kc_id, correct, delta_t, hint, attempt) in enumerate(seq):
+        for t, record in enumerate(seq):
+            kc_id, correct, delta_t, hint, attempt = record[:5]
             sequences[i, t, 0] = float(kc_id)
             sequences[i, t, 1] = float(correct)
             corrects[i, t] = float(correct)
@@ -116,8 +136,11 @@ def collate_batch(batch, max_seq_len: int = 200):
             hints[i, t] = float(hint)
             attempts[i, t] = float(attempt)
             mask[i, t] = True
+            if has_video and len(record) >= 7:
+                watch_ratios[i, t] = float(record[5])
+                is_replays[i, t] = float(record[6])
 
-    return {
+    result = {
         "student_ids": student_ids,
         "sequences": sequences,
         "corrects": corrects,
@@ -126,6 +149,11 @@ def collate_batch(batch, max_seq_len: int = 200):
         "attempts": attempts,
         "mask": mask,
     }
+    if has_video:
+        result["watch_ratios"] = watch_ratios
+        result["is_replays"] = is_replays
+
+    return result
 
 
 def move_batch(batch: dict, device: torch.device) -> dict:
@@ -155,12 +183,19 @@ def get_next_step_loss(
     return criterion(pred_next.squeeze(-1)[label_mask], label_next[label_mask])
 
 
-def infer_num_kc() -> int:
+def infer_num_kc(dataset: str = "2009") -> int:
     """推断知识点数量"""
-    meta_path = DATA_DIR / "meta.json"
+    ds_dir = get_dataset_dir(dataset)
+    if dataset == "mooc":
+        meta_name, enc_name = "meta_mooc.json", "skill_encoder_mooc.pkl"
+    elif dataset == "2017":
+        meta_name, enc_name = "meta_2017.json", "skill_encoder_2017.pkl"
+    else:
+        meta_name, enc_name = "meta.json", "skill_encoder.pkl"
+    meta_path = ds_dir / meta_name
     if meta_path.exists():
         return int(json.loads(meta_path.read_text(encoding="utf-8"))["num_kc"])
-    encoder = load_pickle(DATA_DIR / "skill_encoder.pkl")
+    encoder = load_pickle(ds_dir / enc_name)
     return int(len(encoder.classes_))
 
 
@@ -185,6 +220,8 @@ def evaluate_model(
             batch["delta_ts"],
             batch["hints"],
             batch["attempts"],
+            watch_ratio_seq=batch.get("watch_ratios"),
+            is_replay_seq=batch.get("is_replays"),
             mask=batch["mask"],
         )
         if preds.shape[1] <= 1:
@@ -263,7 +300,9 @@ def train_sr_dkt(
                 batch["delta_ts"],
                 batch["hints"],
                 batch["attempts"],
-                batch["mask"],
+                watch_ratio_seq=batch.get("watch_ratios"),
+                is_replay_seq=batch.get("is_replays"),
+                mask=batch["mask"],
             )
 
             # 计算预测损失
@@ -320,8 +359,8 @@ def train_sr_dkt(
 def main() -> None:
     """主函数：训练 SR-DKT 模型"""
     parser = argparse.ArgumentParser(description="SR-DKT Training Script")
-    parser.add_argument("--dataset", default="2009", choices=["2009", "2017"],
-                        help="选择数据集: 2009 或 2017")
+    parser.add_argument("--dataset", default="2009", choices=["2009", "2017", "mooc"],
+                        help="选择数据集: 2009, 2017 或 mooc")
     parser.add_argument("--lambda_weight", type=float, default=0.01,
                         help="lambda约束损失权重")
     args = parser.parse_args()
@@ -329,19 +368,26 @@ def main() -> None:
     set_seed(CONFIG["seed"])
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[train] 使用设备: {device}")
-    print(f"[train] 数据集: ASSISTments {args.dataset}")
+    dataset_label = "MOOCCubeX" if args.dataset == "mooc" else f"ASSISTments {args.dataset}"
+    print(f"[train] 数据集: {dataset_label}")
 
     # 加载数据
+    ds_dir = get_dataset_dir(args.dataset)
     if args.dataset == "2017":
-        train_data = load_pickle(DATA_DIR / "train_2017.pkl")
-        val_data = load_pickle(DATA_DIR / "val_2017.pkl")
-        meta_path = DATA_DIR / "meta_2017.json"
-        model_save_path = DATA_DIR / "best_model_2017.pt"
+        train_data = load_pickle(ds_dir / "train_2017.pkl")
+        val_data = load_pickle(ds_dir / "val_2017.pkl")
+        meta_path = ds_dir / "meta_2017.json"
+        model_save_path = ds_dir / "best_model_2017.pt"
+    elif args.dataset == "mooc":
+        train_data = load_pickle(ds_dir / "train.pkl")
+        val_data = load_pickle(ds_dir / "val.pkl")
+        meta_path = ds_dir / "meta_mooc.json"
+        model_save_path = ds_dir / "best_model_mooc.pt"
     else:
-        train_data = load_pickle(DATA_DIR / "train.pkl")
-        val_data = load_pickle(DATA_DIR / "val.pkl")
-        meta_path = DATA_DIR / "meta.json"
-        model_save_path = MODEL_PATH
+        train_data = load_pickle(ds_dir / "train.pkl")
+        val_data = load_pickle(ds_dir / "val.pkl")
+        meta_path = ds_dir / "meta.json"
+        model_save_path = ds_dir / "best_model.pt"
 
     num_kc = int(json.loads(meta_path.read_text(encoding="utf-8"))["num_kc"])
     print(f"[train] 知识点数量: {num_kc}")

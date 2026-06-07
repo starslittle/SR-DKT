@@ -1,8 +1,0 @@
-{
-  "num_students": 1708,
-  "num_kc": 102,
-  "avg_seq_len": 551.9988290398127,
-  "train_students": 1366,
-  "val_students": 170,
-  "test_students": 172
-}

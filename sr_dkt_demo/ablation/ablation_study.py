@@ -52,6 +52,13 @@ LOG_PATH = DATA_DIR / "training_logs.json"
 FIG_PATH = ROOT_DIR / "results" / "ablation_bar.png"
 
 
+def get_dataset_dir(dataset: str) -> Path:
+    """根据数据集名称返回对应的子目录"""
+    if dataset == "mooc":
+        return DATA_DIR / "mooc"
+    return DATA_DIR / ("2017" if dataset == "2017" else "2009")
+
+
 def set_seed(seed: int = 42) -> None:
     """固定随机种子"""
     random.seed(seed)
@@ -177,8 +184,9 @@ class SRDKTWithoutStorage(nn.Module):
         decay = torch.exp(-self.lambda_val * delta_t_norm).clamp(min=0.01, max=1.0)
         r_seq = r_raw * decay
 
-        # 预测（只用 Retrieval 隐状态）
-        p_seq = torch.sigmoid(self.fc_pred(h_r))
+        # 预测（对隐状态施加衰减后再预测，与完整模型一致）
+        h_r_decayed = h_r * decay
+        p_seq = torch.sigmoid(self.fc_pred(h_r_decayed))
 
         return p_seq, s_seq, r_seq
 
@@ -277,8 +285,9 @@ class SRDKTWithoutRetrieval(nn.Module):
         decay = torch.exp(-self.lambda_val * delta_t_norm).clamp(min=0.01, max=1.0)
         s_seq = s_raw * decay
 
-        # 预测（只用 Storage 隐状态）
-        p_seq = torch.sigmoid(self.fc_pred(h_s))
+        # 预测（对隐状态施加衰减后再预测，与完整模型一致）
+        h_s_decayed = h_s * decay
+        p_seq = torch.sigmoid(self.fc_pred(h_s_decayed))
 
         return p_seq, s_seq, r_seq
 
@@ -324,6 +333,10 @@ class SRDKTSharedLSTM(nn.Module):
 
         # 注意力融合
         self.fusion_attn = nn.Linear(2, 2)
+
+        # S 和 R 的独立投影头（使 SharedLSTM 的融合操作有意义）
+        self.proj_s = nn.Linear(hidden_size, hidden_size)
+        self.proj_r = nn.Linear(hidden_size, hidden_size)
 
         # 预测头
         self.fc_pred = nn.Linear(hidden_size, 1)
@@ -397,7 +410,7 @@ class SRDKTSharedLSTM(nn.Module):
         alpha_s = alpha[..., 0:1]
         alpha_r = alpha[..., 1:2]
 
-        h_fused = alpha_s * h_shared + alpha_r * h_shared  # 实际上就是 h_shared
+        h_fused = alpha_s * torch.tanh(self.proj_s(h_shared)) + alpha_r * torch.tanh(self.proj_r(h_shared))
 
         # 预测
         p_seq = torch.sigmoid(self.fc_pred(h_fused))
@@ -720,7 +733,9 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device) -> dict
             batch["delta_ts"],
             batch["hints"],
             batch["attempts"],
-            batch["mask"],
+            watch_ratio_seq=batch.get("watch_ratios"),
+            is_replay_seq=batch.get("is_replays"),
+            mask=batch["mask"],
         )
         valid = batch["mask"][:, 1:]
         y_true.extend(batch["corrects"][:, 1:][valid].detach().cpu().numpy().tolist())
@@ -771,7 +786,9 @@ def train_variant(
                 batch["delta_ts"],
                 batch["hints"],
                 batch["attempts"],
-                batch["mask"],
+                watch_ratio_seq=batch.get("watch_ratios"),
+                is_replay_seq=batch.get("is_replays"),
+                mask=batch["mask"],
             )
 
             bce_loss = sequence_loss(preds, batch["corrects"], batch["mask"], criterion)
@@ -890,26 +907,33 @@ def plot_ablation_bar(results: dict[str, dict], save_path: Path) -> None:
 def main() -> None:
     """主函数：运行所有消融实验"""
     parser = argparse.ArgumentParser(description="SR-DKT Ablation Study")
-    parser.add_argument("--dataset", default="2009", choices=["2009", "2017"],
+    parser.add_argument("--dataset", default="2009", choices=["2009", "2017", "mooc"],
                         help="选择数据集")
     args = parser.parse_args()
 
     set_seed(CONFIG["seed"])
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[ablation] 使用设备: {device}")
-    print(f"[ablation] 数据集: ASSISTments {args.dataset}")
+    dataset_labels = {"2009": "ASSISTments 2009", "2017": "ASSISTments 2017", "mooc": "MOOCCubeX"}
+    print(f"[ablation] 数据集: {dataset_labels.get(args.dataset, args.dataset)}")
 
     # 加载数据
+    ds_dir = get_dataset_dir(args.dataset)
     if args.dataset == "2017":
-        train_data = load_pickle(DATA_DIR / "train_2017.pkl")
-        val_data = load_pickle(DATA_DIR / "val_2017.pkl")
-        test_data = load_pickle(DATA_DIR / "test_2017.pkl")
-        meta_path = DATA_DIR / "meta_2017.json"
+        train_data = load_pickle(ds_dir / "train_2017.pkl")
+        val_data = load_pickle(ds_dir / "val_2017.pkl")
+        test_data = load_pickle(ds_dir / "test_2017.pkl")
+        meta_path = ds_dir / "meta_2017.json"
+    elif args.dataset == "mooc":
+        train_data = load_pickle(ds_dir / "train.pkl")
+        val_data = load_pickle(ds_dir / "val.pkl")
+        test_data = load_pickle(ds_dir / "test.pkl")
+        meta_path = ds_dir / "meta_mooc.json"
     else:
-        train_data = load_pickle(DATA_DIR / "train.pkl")
-        val_data = load_pickle(DATA_DIR / "val.pkl")
-        test_data = load_pickle(DATA_DIR / "test.pkl")
-        meta_path = DATA_DIR / "meta.json"
+        train_data = load_pickle(ds_dir / "train.pkl")
+        val_data = load_pickle(ds_dir / "val.pkl")
+        test_data = load_pickle(ds_dir / "test.pkl")
+        meta_path = ds_dir / "meta.json"
 
     num_kc = int(json.loads(meta_path.read_text(encoding="utf-8"))["num_kc"])
     print(f"[ablation] 知识点数量: {num_kc}")

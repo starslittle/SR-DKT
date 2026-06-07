@@ -167,7 +167,13 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 def compute_delta_t(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    parsed_time = pd.to_datetime(df["start_time"], unit="ms", errors="coerce")
+    raw = df["start_time"]
+    # 优先尝试字符串解析（适配 ASSISTments 2009 的 "2009-09-17 10:03:24" 格式）
+    parsed_time = pd.to_datetime(raw, errors="coerce")
+    # 若字符串解析大面积失败，再尝试数值型毫秒时间戳（适配 ASSISTments 2017）
+    if parsed_time.isna().mean() > 0.9:
+        numeric_time = pd.to_numeric(raw, errors="coerce")
+        parsed_time = pd.to_datetime(numeric_time, unit="ms", errors="coerce")
     df["_parsed_time"] = parsed_time
     df["_sort_time"] = parsed_time.fillna(pd.Timestamp("1970-01-01"))
     # 同一时间戳多条记录时需稳定次序，否则 diff 多为 0
@@ -256,7 +262,12 @@ def main() -> None:
 
     encoder = LabelEncoder()
     df["kc_id"] = encoder.fit_transform(df["skill_id"].astype(str))
-    save_pickle(encoder, DATA_DIR / "skill_encoder.pkl")
+
+    # 输出到 data/2009/ 子目录
+    out_dir = DATA_DIR / "2009"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    save_pickle(encoder, out_dir / "skill_encoder.pkl")
     print(f"[preprocess] 已保存 skill_encoder.pkl，知识点数: {len(encoder.classes_)}")
 
     counts = df.groupby("student_id").size()
@@ -266,9 +277,9 @@ def main() -> None:
 
     sequences = build_sequences(df)
     train, val, test = split_by_student(sequences)
-    save_pickle(train, DATA_DIR / "train.pkl")
-    save_pickle(val, DATA_DIR / "val.pkl")
-    save_pickle(test, DATA_DIR / "test.pkl")
+    save_pickle(train, out_dir / "train.pkl")
+    save_pickle(val, out_dir / "val.pkl")
+    save_pickle(test, out_dir / "test.pkl")
 
     lengths = [len(seq) for seq in sequences.values()]
     stats = {
@@ -279,7 +290,7 @@ def main() -> None:
         "val_students": len(val),
         "test_students": len(test),
     }
-    (DATA_DIR / "meta.json").write_text(json.dumps(stats, ensure_ascii=False, indent=2), encoding="utf-8")
+    (out_dir / "meta.json").write_text(json.dumps(stats, ensure_ascii=False, indent=2), encoding="utf-8")
 
     print("========== 数据统计 ==========")
     print(f"总学生数: {stats['num_students']}")

@@ -86,6 +86,8 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device, ablatio
             batch["delta_ts"],
             batch["hints"],
             batch["attempts"],
+            watch_ratio_seq=batch.get("watch_ratios"),
+            is_replay_seq=batch.get("is_replays"),
             mask=batch["mask"],
             ablation_mode=ablation_mode,
         )
@@ -152,6 +154,8 @@ def train_ablation(
                 batch["delta_ts"],
                 batch["hints"],
                 batch["attempts"],
+                watch_ratio_seq=batch.get("watch_ratios"),
+                is_replay_seq=batch.get("is_replays"),
                 mask=batch["mask"],
                 ablation_mode=ablation_mode,
             )
@@ -196,8 +200,10 @@ def train_ablation(
 def print_results(results: dict[str, dict[str, float]], dataset: str = "2009") -> None:
     baseline = results.get("Full SR-DKT", {})
     best_auc = baseline.get("AUC", 0.0)
+    dataset_names = {"2009": "ASSISTments 2009", "2017": "ASSISTments 2017", "mooc": "MOOCCubeX"}
+    ds_name = dataset_names.get(dataset, dataset)
     print("=" * 50)
-    print(f"SR-DKT 消融实验结果（ASSISTments {dataset}）")
+    print(f"SR-DKT 消融实验结果（{ds_name}）")
     print("=" * 50)
     print(f"{'配置':<16}{'AUC':>8}{'ACC':>8}{'F1':>8}")
     print("-" * 50)
@@ -209,26 +215,32 @@ def print_results(results: dict[str, dict[str, float]], dataset: str = "2009") -
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="SR-DKT Ablation Study")
-    parser.add_argument("--dataset", default="2009", choices=["2009", "2017"],
-                        help="选择数据集: 2009 或 2017")
+    parser.add_argument("--dataset", default="2009", choices=["2009", "2017", "mooc"],
+                        help="选择数据集: 2009, 2017 或 mooc")
     args = parser.parse_args()
 
     set_seed(CONFIG["seed"])
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[ablation] 使用设备: {device}")
-    print(f"[ablation] 数据集: ASSISTments {args.dataset}")
+    dataset_labels = {"2009": "ASSISTments 2009", "2017": "ASSISTments 2017", "mooc": "MOOCCubeX"}
+    print(f"[ablation] 数据集: {dataset_labels.get(args.dataset, args.dataset)}")
 
     # 加载数据
     if args.dataset == "2017":
-        train_data = load_pickle(DATA_DIR / "train_2017.pkl")
-        val_data = load_pickle(DATA_DIR / "val_2017.pkl")
-        test_data = load_pickle(DATA_DIR / "test_2017.pkl")
-        meta_path = DATA_DIR / "meta_2017.json"
+        train_data = load_pickle(DATA_DIR / "2017" / "train_2017.pkl")
+        val_data = load_pickle(DATA_DIR / "2017" / "val_2017.pkl")
+        test_data = load_pickle(DATA_DIR / "2017" / "test_2017.pkl")
+        meta_path = DATA_DIR / "2017" / "meta_2017.json"
+    elif args.dataset == "mooc":
+        train_data = load_pickle(DATA_DIR / "mooc" / "train.pkl")
+        val_data = load_pickle(DATA_DIR / "mooc" / "val.pkl")
+        test_data = load_pickle(DATA_DIR / "mooc" / "test.pkl")
+        meta_path = DATA_DIR / "mooc" / "meta_mooc.json"
     else:
-        train_data = load_pickle(DATA_DIR / "train.pkl")
-        val_data = load_pickle(DATA_DIR / "val.pkl")
-        test_data = load_pickle(DATA_DIR / "test.pkl")
-        meta_path = DATA_DIR / "meta.json"
+        train_data = load_pickle(DATA_DIR / "2009" / "train.pkl")
+        val_data = load_pickle(DATA_DIR / "2009" / "val.pkl")
+        test_data = load_pickle(DATA_DIR / "2009" / "test.pkl")
+        meta_path = DATA_DIR / "2009" / "meta.json"
 
     num_kc = int(json.loads(meta_path.read_text(encoding="utf-8"))["num_kc"])
     print(f"[ablation] 知识点数量: {num_kc}")

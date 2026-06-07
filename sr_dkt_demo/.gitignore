@@ -4,14 +4,51 @@ __pycache__/
 *.egg-info/
 .venv/
 .uv-cache/
-
-# Streamlit logs
 *.log
 streamlit.stdin.txt
 
-# Model files
+# Model checkpoints
 *.pt
 
 # IDE
 .idea/
 .vscode/
+
+# ── MOOCCubeX 原始数据（44GB，仅预处理用，不上传） ──
+data/mooc/
+
+# ── 实验产物（运行后自动生成，不上传） ──
+data/*_results*.json
+data/training_logs.json
+data/eval_results.pkl
+data/student_states.pkl
+data/ablation_results.json
+
+# ── 项目工具目录 ──
+.workbuddy/
+results/
+logs/
+
+# ── 预处理器输出（本地环境产物） ──
+data/_archive/
+
+# ── 其他 ──
+*.zip
+*.tar.gz
+*.csv
+SR-DKT*.md
+export_train_table.py
+AutoDL实验流程.md
+references/
+
+# ── 保留 ASSISTments 数据（小文件，已跟踪，用于快速验证） ──
+!data/meta.json
+!data/meta_2017.json
+!data/skill_encoder.pkl
+!data/skill_encoder_2017.pkl
+!data/train.pkl
+!data/val.pkl
+!data/test.pkl
+!data/train_2017.pkl
+!data/val_2017.pkl
+!data/test_2017.pkl

@@ -20,30 +20,41 @@ def sinusoidal_position_encoding(seq_len: int, d_model: int, device: torch.devic
 
 
 class DKT(nn.Module):
-    """Deep Knowledge Tracing, Piech et al., 2015."""
+    """Deep Knowledge Tracing, Piech et al., 2015.
+    
+    NOTE: Use Embedding instead of one-hot encoding to support 
+    large KC vocabulary (e.g. MOOCCubeX with 30,000+ KCs).
+    This reduces input dimension from O(num_kc) to O(hidden_size).
+    """
 
     def __init__(self, num_kc: int, hidden_size: int = 128) -> None:
         super().__init__()
         self.num_kc = num_kc
-        self.lstm = nn.LSTM(num_kc + 1, hidden_size, batch_first=True)
+        self.kc_embed = nn.Embedding(num_kc + 1, hidden_size)  # +1 for OOD/OTHER
+        self.lstm = nn.LSTM(hidden_size + 1, hidden_size, batch_first=True)
         self.fc = nn.Linear(hidden_size, 1)
 
     def forward(self, kc_ids: torch.Tensor, corrects: torch.Tensor, mask: torch.Tensor | None = None):
-        kc_one_hot = F.one_hot(kc_ids.long().clamp(min=0), num_classes=self.num_kc).float()
-        x = torch.cat([kc_one_hot, corrects.float().unsqueeze(-1)], dim=-1)
+        kc_emb = self.kc_embed(kc_ids.long().clamp(min=0, max=self.num_kc))
+        x = torch.cat([kc_emb, corrects.float().unsqueeze(-1)], dim=-1)
         hidden, _ = self.lstm(x)
         logits = torch.sigmoid(self.fc(hidden))
         return logits, hidden
 
 
 class DKT_F(nn.Module):
-    """DKT with Forgetting, extending DKT with time-decayed hidden states."""
+    """DKT with Forgetting, extending DKT with time-decayed hidden states.
+    
+    NOTE: Use Embedding instead of one-hot encoding to support 
+    large KC vocabulary (e.g. MOOCCubeX with 30,000+ KCs).
+    """
 
     def __init__(self, num_kc: int, hidden_size: int = 128) -> None:
         super().__init__()
         self.num_kc = num_kc
         self.hidden_size = hidden_size
-        self.cell = nn.LSTMCell(num_kc + 1, hidden_size)
+        self.kc_embed = nn.Embedding(num_kc + 1, hidden_size)  # +1 for OOD/OTHER
+        self.cell = nn.LSTMCell(hidden_size + 1, hidden_size)
         self.fc = nn.Linear(hidden_size, 1)
         self.lambda_param = nn.Parameter(torch.tensor(0.1))
 
@@ -56,8 +67,8 @@ class DKT_F(nn.Module):
     ):
         batch_size, seq_len = kc_ids.shape
         device = kc_ids.device
-        kc_one_hot = F.one_hot(kc_ids.long().clamp(min=0), num_classes=self.num_kc).float()
-        x = torch.cat([kc_one_hot, corrects.float().unsqueeze(-1)], dim=-1)
+        kc_emb = self.kc_embed(kc_ids.long().clamp(min=0, max=self.num_kc))
+        x = torch.cat([kc_emb, corrects.float().unsqueeze(-1)], dim=-1)
         if delta_t is None:
             delta_t = torch.zeros(batch_size, seq_len, device=device)
 
@@ -66,7 +77,9 @@ class DKT_F(nn.Module):
         outputs = []
         lambda_value = F.softplus(self.lambda_param)
         for t in range(seq_len):
-            h = h * torch.exp(-lambda_value * delta_t[:, t].float().unsqueeze(-1).clamp(min=0.0))
+            decay_t = torch.exp(-lambda_value * delta_t[:, t].float().unsqueeze(-1).clamp(min=0.0))
+            h = h * decay_t
+            c = c * decay_t
             h_new, c_new = self.cell(x[:, t, :], (h, c))
             if mask is not None:
                 valid = mask[:, t].float().unsqueeze(-1)
@@ -80,69 +93,371 @@ class DKT_F(nn.Module):
         return logits, hidden
 
 
-class SAKT(nn.Module):
-    """Self-Attentive Knowledge Tracing, Pandey and Karypis, 2019."""
+# ──────────────────── Transformer Block (shared) ────────────────────
 
-    def __init__(self, num_kc: int, hidden_size: int = 128) -> None:
+class TransformerBlock(nn.Module):
+    """Single Transformer encoder block: MultiheadAttention + FFN + residual + LN."""
+
+    def __init__(self, emb_size: int, num_heads: int = 4, dropout: float = 0.1) -> None:
+        super().__init__()
+        self.attn = nn.MultiheadAttention(emb_size, num_heads, dropout=dropout, batch_first=True)
+        self.attn_dropout = nn.Dropout(dropout)
+        self.attn_norm = nn.LayerNorm(emb_size)
+
+        self.ffn = nn.Sequential(
+            nn.Linear(emb_size, emb_size * 4),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(emb_size * 4, emb_size),
+        )
+        self.ffn_dropout = nn.Dropout(dropout)
+        self.ffn_norm = nn.LayerNorm(emb_size)
+
+    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                key_padding_mask: torch.Tensor | None = None) -> torch.Tensor:
+        """Cross-attention: Q attends to K=V. Returns transformed K/V.
+
+        Uses generate_square_subsequent_mask for correct causal masking
+        and converts key_padding_mask to float to avoid type conflicts.
+        """
+        seq_len = k.size(1)
+        causal_mask = nn.Transformer.generate_square_subsequent_mask(
+            seq_len, device=k.device
+        )  # float32, upper-tri = -inf
+
+        # key_padding_mask must match dtype (float, not bool)
+        kp_float: torch.Tensor | None = None
+        if key_padding_mask is not None:
+            kp_float = torch.zeros_like(key_padding_mask, dtype=torch.float)
+            kp_float = kp_float.masked_fill(key_padding_mask, float("-inf"))
+
+        attn_out, _ = self.attn(
+            q, k, v, attn_mask=causal_mask, key_padding_mask=kp_float
+        )
+        attn_out = self.attn_norm(q + self.attn_dropout(attn_out))
+
+        ffn_out = self.ffn(attn_out)
+        ffn_out = self.ffn_norm(attn_out + self.ffn_dropout(ffn_out))
+
+        return ffn_out  # serves as k/v for next block
+
+
+# ──────────────────── SAKT (pyKT 兼容 cross-attention) ────────────────────
+
+class SAKT(nn.Module):
+    """SAKT with cross-attention, Pandey & Karypis, 2019 (pyKT-compatible).
+
+    Core mechanism:
+    - interaction_emb(q + num_kc * r)  →  encodes history as key/value
+    - exercise_emb(next_exercise)      →  next exercise as query
+    - Cross-attention layers           →  Q attends to K=V with causal mask
+    - Output: next-step prediction probability
+
+    Differs from naive self-attention SAKT: uses the next exercise embedding
+    as an explicit query token, which is the original paper's design.
+    """
+
+    def __init__(self, num_kc: int, hidden_size: int = 128, seq_len: int = 200,
+                 num_heads: int = 4, dropout: float = 0.1, num_layers: int = 2) -> None:
         super().__init__()
         self.num_kc = num_kc
         self.hidden_size = hidden_size
-        self.kc_embed = nn.Embedding(num_kc, hidden_size)
-        self.correct_embed = nn.Embedding(2, hidden_size)
-        self.attn = nn.MultiheadAttention(hidden_size, num_heads=4, batch_first=True)
-        self.norm = nn.LayerNorm(hidden_size)
-        self.fc = nn.Linear(hidden_size, 1)
 
-    def encode(self, kc_ids: torch.Tensor, corrects: torch.Tensor) -> torch.Tensor:
-        x = self.kc_embed(kc_ids.long().clamp(min=0)) + self.correct_embed(corrects.long().clamp(min=0, max=1))
-        return x + sinusoidal_position_encoding(kc_ids.shape[1], self.hidden_size, kc_ids.device)
+        self.interaction_emb = nn.Embedding(num_kc * 2, hidden_size)
+        self.exercise_emb = nn.Embedding(num_kc, hidden_size)
 
-    def forward(self, kc_ids: torch.Tensor, corrects: torch.Tensor, mask: torch.Tensor | None = None):
-        x = self.encode(kc_ids, corrects)
-        seq_len = kc_ids.shape[1]
-        causal_mask = torch.triu(torch.ones(seq_len, seq_len, device=kc_ids.device, dtype=torch.bool), diagonal=1)
-        key_padding_mask = ~mask.bool() if mask is not None else None
-        attn_output, _ = self.attn(x, x, x, attn_mask=causal_mask, key_padding_mask=key_padding_mask)
-        hidden = self.norm(x + attn_output)
-        logits = torch.sigmoid(self.fc(hidden))
-        return logits, hidden
+        self.pos_emb = nn.Embedding(seq_len, hidden_size)
+
+        self.blocks = nn.ModuleList([
+            TransformerBlock(hidden_size, num_heads, dropout)
+            for _ in range(num_layers)
+        ])
+
+        self.dropout = nn.Dropout(dropout)
+        self.pred = nn.Linear(hidden_size, 1)
+
+    def forward(self, kc_ids: torch.Tensor, corrects: torch.Tensor,
+                mask: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Forward with cross-attention.
+
+        Args:
+            kc_ids:  (B, T)  concept/exercise IDs
+            corrects: (B, T)  0/1 correctness
+            mask:     (B, T)  bool padding mask
+
+        Returns:
+            preds:  (B, T, 1)  predictions, pred[t] answers corrects[t+1]
+            hidden: None       (kept for API compatibility)
+        """
+        B, T = kc_ids.shape
+        device = kc_ids.device
+        T1 = T - 1  # number of prediction steps
+
+        if T1 <= 0:
+            preds = torch.zeros(B, T, 1, device=device)
+            return preds, None
+
+        # ── History (key/value) and Query ──
+        q_hist = kc_ids[:, :T1].long().clamp(min=0, max=self.num_kc - 1)
+        r_hist = corrects[:, :T1].long().clamp(min=0, max=1)
+        q_query = kc_ids[:, 1:].long().clamp(min=0, max=self.num_kc - 1)
+
+        # Interaction embedding for past history  →  K, V
+        x_int = q_hist + self.num_kc * r_hist                     # (B, T-1)
+        kv_emb = self.interaction_emb(x_int)                     # (B, T-1, E)
+
+        # Exercise embedding for next-step query  →  Q
+        q_emb = self.exercise_emb(q_query)                       # (B, T-1, E)
+
+        # Position encoding (learnable)
+        positions = torch.arange(T1, device=device).unsqueeze(0).expand(B, -1)
+        kv_emb = kv_emb + self.pos_emb(positions)
+
+        # Padding mask for history
+        kp_mask = ~mask[:, :T1] if mask is not None else None
+
+        # ── Cross-attention blocks ──
+        kv_out = kv_emb
+        for block in self.blocks:
+            kv_out = block(q_emb, kv_out, kv_out, key_padding_mask=kp_mask)
+
+        kv_out = self.dropout(kv_out)
+        preds_step = torch.sigmoid(self.pred(kv_out)).squeeze(-1)   # (B, T-1)
+
+        # ── Align with next-step prediction format ──
+        # preds[t] should predict corrects[t+1] for t=0..T-2
+        preds = torch.zeros(B, T, 1, device=device)
+        preds[:, :T1, 0] = preds_step
+
+        return preds, None
+
+
+# ──────────────────── AKT (论文对齐版：双 Transformer + 距离感知注意力) ────────────────────
+
+class AKTBlock(nn.Module):
+    """Single Transformer block for AKT: distance-aware attention + FFN + residual + LN."""
+
+    def __init__(self, emb_size: int, num_heads: int = 4, dropout: float = 0.1,
+                 kq_same: bool = True) -> None:
+        super().__init__()
+        self.emb_size = emb_size
+        self.d_k = emb_size // num_heads
+        self.num_heads = num_heads
+        self.kq_same = kq_same
+
+        # QKV projections
+        self.q_linear = nn.Linear(emb_size, emb_size)
+        if kq_same:
+            self.k_linear = self.q_linear  # share K/Q weights (pyKT default)
+        else:
+            self.k_linear = nn.Linear(emb_size, emb_size)
+        self.v_linear = nn.Linear(emb_size, emb_size)
+
+        # Per-head gamma for distance-aware monotonic attention
+        self.gammas = nn.Parameter(torch.ones(num_heads, 1, 1) * 0.5)
+
+        self.out_proj = nn.Linear(emb_size, emb_size)
+        self.attn_dropout = nn.Dropout(dropout)
+        self.attn_norm = nn.LayerNorm(emb_size)
+
+        # FFN
+        self.ffn = nn.Sequential(
+            nn.Linear(emb_size, emb_size),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(emb_size, emb_size),
+        )
+        self.ffn_dropout = nn.Dropout(dropout)
+        self.ffn_norm = nn.LayerNorm(emb_size)
+
+    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                apply_pos: bool = True, causal_mask: torch.Tensor | None = None,
+                key_padding_mask: torch.Tensor | None = None) -> torch.Tensor:
+        """Distance-aware multi-head attention with residual + FFN.
+
+        Args:
+            q: Query tensor (B, T_q, E)
+            k: Key tensor (B, T_k, E)
+            v: Value tensor (B, T_k, E)
+            apply_pos: Whether to apply residual + norm (False for first sub-layer in blocks_2)
+            causal_mask: (T_q, T_k) bool mask, True = do NOT attend
+            key_padding_mask: (B, T_k) bool mask, True = padded (ignore)
+        """
+        B, T_q, _ = q.shape
+        T_k = k.size(1)
+
+        # QKV projections
+        q_proj = self.q_linear(q).view(B, T_q, self.num_heads, self.d_k).transpose(1, 2)
+        k_proj = self.k_linear(k).view(B, T_k, self.num_heads, self.d_k).transpose(1, 2)
+        v_proj = self.v_linear(v).view(B, T_k, self.num_heads, self.d_k).transpose(1, 2)
+
+        # Attention scores
+        scores = torch.matmul(q_proj, k_proj.transpose(-2, -1)) / math.sqrt(self.d_k)
+
+        # Distance-aware exponential decay (per-head, monotonic)
+        idx_q = torch.arange(T_q, device=q.device)
+        idx_k = torch.arange(T_k, device=k.device)
+        distance = (idx_q.unsqueeze(1) - idx_k.unsqueeze(0)).abs().float()  # (T_q, T_k)
+        gamma = -F.softplus(self.gammas)  # negative → decay
+        decay = torch.exp(gamma * distance.unsqueeze(0))  # (num_heads, T_q, T_k)
+        scores = scores * decay  # multiplicative decay (论文原始方式)
+
+        # Causal mask
+        if causal_mask is not None:
+            scores = scores.masked_fill(causal_mask.unsqueeze(0).unsqueeze(0), float("-inf"))
+
+        # Key padding mask
+        if key_padding_mask is not None:
+            scores = scores.masked_fill(
+                key_padding_mask.unsqueeze(1).unsqueeze(2), float("-inf")
+            )
+
+        weights = torch.softmax(scores, dim=-1)
+        weights = self.attn_dropout(weights)
+
+        attn_out = torch.matmul(weights, v_proj)  # (B, H, T_q, d_k)
+        attn_out = attn_out.transpose(1, 2).contiguous().view(B, T_q, self.emb_size)
+        attn_out = self.out_proj(attn_out)
+
+        # Residual + LayerNorm
+        if apply_pos:
+            attn_out = self.attn_norm(q + attn_out)
+        else:
+            attn_out = q + attn_out
+
+        # FFN + residual + LayerNorm
+        ffn_out = self.ffn(attn_out)
+        ffn_out = self.ffn_norm(attn_out + self.ffn_dropout(ffn_out))
+
+        return ffn_out
 
 
 class AKT(nn.Module):
-    """Attentive Knowledge Tracing with monotonic distance penalty, Ghosh et al., 2020."""
+    """AKT: Context-Aware Attentive Knowledge Tracing, Ghosh et al., 2020.
 
-    def __init__(self, num_kc: int, hidden_size: int = 128) -> None:
+    Aligned with original paper architecture:
+    - blocks_1: QA interaction encoder (self-attention with distance-aware decay)
+    - blocks_2: Question decoder (alternating self-attn + cross-attn with blocks_1 output)
+    - Output: concat(context_output, q_embed) → 3-layer MLP (skip connection)
+    - Rasch difficulty: omitted (akt_cid variant for concept-level, MOOCCubeX has no problem-id)
+
+    This follows pyKT's AKT implementation (akt_cid mode) with:
+    - n_blocks=1 default → blocks_1 has 1 layer, blocks_2 has 2 layers
+    - Distance-aware attention with per-head gamma (multiplicative exponential decay)
+    - Separate question embedding + QA interaction embedding
+    """
+
+    def __init__(self, num_kc: int, hidden_size: int = 128, num_heads: int = 4,
+                 dropout: float = 0.1, n_blocks: int = 1,
+                 final_fc_dim: int = 512, kq_same: bool = True) -> None:
         super().__init__()
         self.num_kc = num_kc
         self.hidden_size = hidden_size
-        self.kc_embed = nn.Embedding(num_kc, hidden_size)
-        self.correct_embed = nn.Embedding(2, hidden_size)
-        self.q_proj = nn.Linear(hidden_size, hidden_size)
-        self.k_proj = nn.Linear(hidden_size, hidden_size)
-        self.v_proj = nn.Linear(hidden_size, hidden_size)
-        self.penalty = nn.Parameter(torch.tensor(1.0))
-        self.norm = nn.LayerNorm(hidden_size)
-        self.fc = nn.Linear(hidden_size, 1)
+        self.n_blocks = n_blocks
 
-    def forward(self, kc_ids: torch.Tensor, corrects: torch.Tensor, mask: torch.Tensor | None = None):
-        x = self.kc_embed(kc_ids.long().clamp(min=0)) + self.correct_embed(corrects.long().clamp(min=0, max=1))
-        x = x + sinusoidal_position_encoding(kc_ids.shape[1], self.hidden_size, kc_ids.device)
-        q, k, v = self.q_proj(x), self.k_proj(x), self.v_proj(x)
-        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.hidden_size)
+        # Separate embeddings (matching original paper)
+        # Question/concept embedding
+        self.q_embed = nn.Embedding(num_kc, hidden_size)
+        # QA interaction embedding: combines question + correctness
+        self.qa_embed = nn.Embedding(num_kc * 2, hidden_size)
 
-        seq_len = kc_ids.shape[1]
-        idx = torch.arange(seq_len, device=kc_ids.device)
-        distance = torch.abs(idx.unsqueeze(0) - idx.unsqueeze(1)).float()
-        scores = scores - F.softplus(self.penalty) * distance.unsqueeze(0)
-        causal_mask = torch.triu(torch.ones(seq_len, seq_len, device=kc_ids.device, dtype=torch.bool), diagonal=1)
-        scores = scores.masked_fill(causal_mask.unsqueeze(0), float("-inf"))
-        if mask is not None:
-            scores = scores.masked_fill((~mask.bool()).unsqueeze(1), float("-inf"))
-        weights = torch.softmax(scores, dim=-1)
-        attn_output = torch.matmul(weights, v)
-        hidden = self.norm(x + attn_output)
-        logits = torch.sigmoid(self.fc(hidden))
-        return logits, hidden
+        # blocks_1: QA interaction encoder (self-attention)
+        self.blocks_1 = nn.ModuleList([
+            AKTBlock(hidden_size, num_heads, dropout, kq_same=kq_same)
+            for _ in range(n_blocks)
+        ])
+
+        # blocks_2: Question decoder (2*n_blocks layers, alternating self + cross)
+        self.blocks_2 = nn.ModuleList([
+            AKTBlock(hidden_size, num_heads, dropout, kq_same=kq_same)
+            for _ in range(n_blocks * 2)
+        ])
+
+        self.dropout_layer = nn.Dropout(dropout)
+
+        # Output MLP with skip connection:
+        # Input: concat(context_output, q_embed) = hidden_size * 2
+        # Structure: d_model*2 → 512 → 256 → 1 (matching original)
+        self.out_mlp = nn.Sequential(
+            nn.Linear(hidden_size * 2, final_fc_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(final_fc_dim, final_fc_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(final_fc_dim // 2, 1),
+        )
+
+    def forward(self, kc_ids: torch.Tensor, corrects: torch.Tensor,
+                mask: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+        """Forward with dual-Transformer + distance-aware attention.
+
+        Args:
+            kc_ids:   (B, T)  concept/exercise IDs
+            corrects: (B, T)  0/1 correctness
+            mask:     (B, T)  bool padding mask (True = valid)
+
+        Returns:
+            logits: (B, T, 1)  predictions
+            hidden: (B, T, E)  contextualized representations
+        """
+        B, T = kc_ids.shape
+        device = kc_ids.device
+
+        # ── Embeddings ──
+        q_clamped = kc_ids.long().clamp(min=0, max=self.num_kc - 1)
+        r_clamped = corrects.long().clamp(min=0, max=1)
+
+        # Question embedding
+        q_emb = self.q_embed(q_clamped)  # (B, T, E)
+
+        # QA interaction embedding: qa_id = q + num_kc * r
+        qa_ids = q_clamped + self.num_kc * r_clamped  # range [0, 2*num_kc-1]
+        qa_emb = self.qa_embed(qa_ids)  # (B, T, E)
+
+        # Position encoding (sinusoidal, added to both)
+        pe = sinusoidal_position_encoding(T, self.hidden_size, device)
+        qa_emb = qa_emb + pe
+        q_emb = q_emb + pe
+
+        # ── Causal mask ──
+        causal_mask = torch.triu(
+            torch.ones(T, T, device=device, dtype=torch.bool), diagonal=1
+        )
+
+        # Key padding mask: True = padded/ignore
+        kp_mask = ~mask if mask is not None else None
+
+        # ── blocks_1: QA interaction encoder ──
+        # Self-attention on QA interactions
+        y = qa_emb
+        for block in self.blocks_1:
+            y = block(y, y, y, apply_pos=True, causal_mask=causal_mask,
+                      key_padding_mask=kp_mask)
+
+        # ── blocks_2: Question decoder ──
+        # Alternating: odd layers = self-attention on questions
+        #              even layers = cross-attention (questions attend to encoded QA)
+        x = q_emb
+        for i, block in enumerate(self.blocks_2):
+            if i % 2 == 0:
+                # Odd layer (0-indexed even): self-attention on questions, no residual norm
+                x = block(x, x, x, apply_pos=False, causal_mask=causal_mask,
+                          key_padding_mask=kp_mask)
+            else:
+                # Even layer: cross-attention (Q=questions, K/V=encoded QA from blocks_1)
+                x = block(x, y, y, apply_pos=True, causal_mask=causal_mask,
+                          key_padding_mask=kp_mask)
+
+        # ── Output with skip connection ──
+        # Concatenate context output with original question embedding
+        # (Skip connection matching original paper)
+        q_emb_raw = self.q_embed(q_clamped)  # re-lookup without position encoding
+        out_input = torch.cat([x, q_emb_raw], dim=-1)  # (B, T, 2*E)
+        out_input = self.dropout_layer(out_input)
+        logits = torch.sigmoid(self.out_mlp(out_input))  # (B, T, 1)
+
+        return logits, x
 
 
 class LBKT(nn.Module):
@@ -170,8 +485,12 @@ class LBKT(nn.Module):
         x = self.kc_embed(kc_ids.long().clamp(min=0)) + self.correct_embed(corrects.long().clamp(min=0, max=1))
         x = x + sinusoidal_position_encoding(kc_ids.shape[1], self.hidden_size, kc_ids.device)
         seq_len = kc_ids.shape[1]
-        causal_mask = torch.triu(torch.ones(seq_len, seq_len, device=kc_ids.device, dtype=torch.bool), diagonal=1)
-        key_padding_mask = ~mask.bool() if mask is not None else None
+        # Use float masks to avoid bool dtype conflicts in PyTorch 2.0+
+        causal_mask = nn.Transformer.generate_square_subsequent_mask(seq_len, device=kc_ids.device)
+        key_padding_mask: torch.Tensor | None = None
+        if mask is not None:
+            key_padding_mask = torch.zeros_like(mask, dtype=torch.float)
+            key_padding_mask = key_padding_mask.masked_fill(~mask, float("-inf"))
         attn_output, _ = self.attn(x, x, x, attn_mask=causal_mask, key_padding_mask=key_padding_mask)
 
         if hint_count is None:
@@ -211,11 +530,11 @@ class DKVMN(nn.Module):
         )
 
         # 题目 embedding → 查询 Key Memory
-        self.kc_embed = nn.Embedding(num_kc + 1, hidden_size // 2, padding_idx=0)
+        self.kc_embed = nn.Embedding(num_kc + 1, hidden_size // 2)
 
         # 交互 embedding（kc + correct）→ 写入 Value Memory
         self.interaction_embed = nn.Embedding(
-            num_kc * 2 + 2, hidden_size, padding_idx=0
+            num_kc * 2 + 2, hidden_size
         )
 
         # Read 网络：[value_read, kc_emb] → 知识状态
@@ -306,9 +625,9 @@ class BEKT(nn.Module):
         self.num_kc = num_kc
         self.hidden_size = hidden_size
 
-        self.kc_embed = nn.Embedding(num_kc + 1, hidden_size, padding_idx=0)
+        self.kc_embed = nn.Embedding(num_kc, hidden_size)
         self.correct_embed = nn.Embedding(2, hidden_size)
-        self.interaction_embed = nn.Embedding(num_kc * 2 + 1, hidden_size, padding_idx=0)
+        self.interaction_embed = nn.Embedding(num_kc * 2, hidden_size)
 
         self.question_encoder = nn.TransformerEncoderLayer(
             d_model=hidden_size, nhead=num_heads,
@@ -360,25 +679,28 @@ class BEKT(nn.Module):
         if delta_t is None:
             delta_t = torch.zeros(B, T, device=device)
 
-        interaction_ids = (kc_ids * 2 + corrects.long()).clamp(0, self.num_kc * 2)
+        interaction_ids = (kc_ids * 2 + corrects.long()).clamp(0, self.num_kc * 2 - 1)
 
-        kc_emb = self.kc_embed(kc_ids.clamp(0, self.num_kc))
+        kc_emb = self.kc_embed(kc_ids.clamp(0, self.num_kc - 1))
         inter_emb = self.interaction_embed(interaction_ids)
 
-        causal_mask = torch.triu(
-            torch.ones(T, T, device=device, dtype=torch.bool), diagonal=1
-        )
+        # Use float masks to avoid bool dtype conflicts in PyTorch 2.0+
+        causal_mask = nn.Transformer.generate_square_subsequent_mask(T, device=device)
+        kp_float: torch.Tensor | None = None
+        if mask is not None:
+            kp_float = torch.zeros_like(mask, dtype=torch.float)
+            kp_float = kp_float.masked_fill(~mask, float("-inf"))
 
         q_enc = self.question_encoder(
             kc_emb,
             src_mask=causal_mask,
-            src_key_padding_mask=~mask
+            src_key_padding_mask=kp_float
         )
 
         k_enc = self.knowledge_encoder(
             inter_emb,
             src_mask=causal_mask,
-            src_key_padding_mask=~mask
+            src_key_padding_mask=kp_float
         )
 
         delta_norm = torch.log1p(delta_t.float().clamp(min=0)) / \
@@ -389,7 +711,7 @@ class BEKT(nn.Module):
         ks_retrieved, _ = self.retrieval_attn(
             q_enc, k_enc_decayed, k_enc_decayed,
             attn_mask=causal_mask,
-            key_padding_mask=~mask
+            key_padding_mask=kp_float
         )
 
         hint_norm = hint_count.float().clamp(0, 5) / 5.0

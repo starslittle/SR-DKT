@@ -22,15 +22,32 @@ DATA_MODEL_PATH = DATA_DIR / "best_model.pt"
 EVAL_PATH = DATA_DIR / "eval_results.pkl"
 
 
+def get_dataset_dir(dataset: str) -> Path:
+    """根据数据集名称返回对应的子目录"""
+    if dataset == "mooc":
+        return DATA_DIR / "mooc"
+    return DATA_DIR / ("2017" if dataset == "2017" else "2009")
+
+
 def load_pickle(path: Path):
     with path.open("rb") as f:
         return pickle.load(f)
 
 
 @torch.no_grad()
-def evaluate_kt_model() -> tuple[float, float]:
+def evaluate_kt_model(dataset: str = "2009") -> tuple[float, float]:
+    ds_dir = get_dataset_dir(dataset)
+    if dataset == "mooc":
+        model_name = "best_model_mooc.pt"
+    elif dataset == "2017":
+        model_name = "best_model_2017.pt"
+    else:
+        model_name = "best_model.pt"
+    model_path = ds_dir / model_name
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model_path = DATA_MODEL_PATH if DATA_MODEL_PATH.exists() else MODEL_PATH
+    if not model_path.exists():
+        model_path = DATA_MODEL_PATH if DATA_MODEL_PATH.exists() else MODEL_PATH
     checkpoint = torch.load(model_path, map_location=device, weights_only=True)
     model = SRDKT(
         num_kc=int(checkpoint["num_kc"]),
@@ -40,7 +57,8 @@ def evaluate_kt_model() -> tuple[float, float]:
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
 
-    test_data = load_pickle(DATA_DIR / "test.pkl")
+    test_name = "test_2017.pkl" if dataset == "2017" else "test.pkl"
+    test_data = load_pickle(ds_dir / test_name)
     loader = DataLoader(SequenceDataset(test_data), batch_size=64, shuffle=False, collate_fn=collate_batch)
     y_true, y_pred = [], []
 
@@ -51,7 +69,9 @@ def evaluate_kt_model() -> tuple[float, float]:
             batch["delta_ts"],
             batch["hints"],
             batch["attempts"],
-            batch["mask"],
+            watch_ratio_seq=batch.get("watch_ratios"),
+            is_replay_seq=batch.get("is_replays"),
+            mask=batch["mask"],
         )
         if preds.shape[1] <= 1:
             continue
@@ -79,9 +99,12 @@ def kc_midpoint_gain(seq: list[tuple], kc_id: int) -> float | None:
     return float(np.mean(after) - np.mean(before))
 
 
-def evaluate_harness() -> tuple[float, float, float]:
-    test_data = load_pickle(DATA_DIR / "test.pkl")
-    student_states = load_pickle(DATA_DIR / "student_states.pkl")
+def evaluate_harness(dataset: str = "2009") -> tuple[float, float, float]:
+    ds_dir = get_dataset_dir(dataset)
+    test_name = "test_2017.pkl" if dataset == "2017" else "test.pkl"
+    states_name = "student_states_2017.pkl" if dataset == "2017" else "student_states.pkl"
+    test_data = load_pickle(ds_dir / test_name)
+    student_states = load_pickle(ds_dir / states_name)
     agent = HarnessAgent(student_states)
 
     gains = []
@@ -119,7 +142,7 @@ def evaluate_harness() -> tuple[float, float, float]:
             if gain > 0.0:
                 hit_count += 1
 
-        hr_values.append(hit_count / 10.0)
+        hr_values.append(hit_count / max(min(10, len(recs)), 1))
         if len(rec_gains) >= 2 and np.sum(rec_gains) > 0:
             ndcg_values.append(float(ndcg_score([rec_gains], [scores], k=min(10, len(rec_gains)))))
         else:
@@ -132,14 +155,37 @@ def evaluate_harness() -> tuple[float, float, float]:
 
 
 def main() -> None:
-    if EVAL_PATH.exists():
-        eval_results = load_pickle(EVAL_PATH)
-        auc = float(eval_results.get("AUC", 0.5))
-        acc = float(eval_results.get("ACC", 0.0))
+    import argparse
+    parser = argparse.ArgumentParser(description="SR-DKT Evaluation")
+    parser.add_argument("--dataset", default="2009", choices=["2009", "2017", "mooc"],
+                        help="选择数据集: 2009, 2017 或 mooc")
+    args = parser.parse_args()
+
+    ds_dir = get_dataset_dir(args.dataset)
+    if args.dataset == "mooc":
+        eval_name, model_name = "eval_results_mooc.pkl", "best_model_mooc.pt"
+    elif args.dataset == "2017":
+        eval_name, model_name = "eval_results_2017.pkl", "best_model_2017.pt"
     else:
-        auc, acc = evaluate_kt_model()
-    wcg, hr10, ndcg10 = evaluate_harness()
-    with EVAL_PATH.open("wb") as f:
+        eval_name, model_name = "eval_results.pkl", "best_model.pt"
+    eval_path = ds_dir / eval_name
+    model_path = ds_dir / model_name
+
+    need_eval = True
+    if eval_path.exists() and model_path.exists():
+        eval_mtime = eval_path.stat().st_mtime
+        model_mtime = model_path.stat().st_mtime
+        if eval_mtime > model_mtime:
+            eval_results = load_pickle(eval_path)
+            auc = float(eval_results.get("AUC", 0.5))
+            acc = float(eval_results.get("ACC", 0.0))
+            need_eval = False
+            print("[evaluate] 使用缓存的评估结果（模型未更新）")
+
+    if need_eval:
+        auc, acc = evaluate_kt_model(args.dataset)
+    wcg, hr10, ndcg10 = evaluate_harness(args.dataset)
+    with eval_path.open("wb") as f:
         pickle.dump({"AUC": auc, "ACC": acc, "WCG": wcg, "HR10": hr10, "NDCG10": ndcg10}, f)
 
     print("========== SR-DKT 评估报告 ==========")

@@ -19,6 +19,13 @@ STATE_PATH = DATA_DIR / "student_states.pkl"
 EVAL_PATH = DATA_DIR / "eval_results.pkl"
 
 
+def get_dataset_dir(dataset: str) -> Path:
+    """根据数据集名称返回对应的子目录"""
+    if dataset == "mooc":
+        return DATA_DIR / "mooc"
+    return DATA_DIR / ("2017" if dataset == "2017" else "2009")
+
+
 def load_pickle(path: Path):
     with path.open("rb") as f:
         return pickle.load(f)
@@ -26,8 +33,27 @@ def load_pickle(path: Path):
 
 @torch.no_grad()
 def main() -> None:
+    import argparse
+    parser = argparse.ArgumentParser(description="Export Student States")
+    parser.add_argument("--dataset", default="2009", choices=["2009", "2017", "mooc"],
+                        help="选择数据集: 2009, 2017 或 mooc")
+    args = parser.parse_args()
+
+    ds_dir = get_dataset_dir(args.dataset)
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    checkpoint = torch.load(MODEL_PATH, map_location=device, weights_only=True)
+
+    if args.dataset == "mooc":
+        model_name = "best_model_mooc.pt"
+    elif args.dataset == "2017":
+        model_name = "best_model_2017.pt"
+    else:
+        model_name = "best_model.pt"
+    model_path = ds_dir / model_name
+    if not model_path.exists():
+        model_path = MODEL_PATH
+
+    checkpoint = torch.load(model_path, map_location=device, weights_only=True)
     model = SRDKT(
         num_kc=int(checkpoint["num_kc"]),
         hidden_size=int(checkpoint["config"]["hidden_size"]),
@@ -36,8 +62,14 @@ def main() -> None:
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
 
-    test_data = load_pickle(DATA_DIR / "test.pkl")
-    encoder = load_pickle(DATA_DIR / "skill_encoder.pkl")
+    if args.dataset == "mooc":
+        test_name, enc_name = "test.pkl", "skill_encoder_mooc.pkl"
+    elif args.dataset == "2017":
+        test_name, enc_name = "test_2017.pkl", "skill_encoder_2017.pkl"
+    else:
+        test_name, enc_name = "test.pkl", "skill_encoder.pkl"
+    test_data = load_pickle(ds_dir / test_name)
+    encoder = load_pickle(ds_dir / enc_name)
     kc_names = {i: str(name) for i, name in enumerate(encoder.classes_)}
 
     loader = DataLoader(SequenceDataset(test_data), batch_size=64, shuffle=False, collate_fn=collate_batch)
@@ -51,7 +83,9 @@ def main() -> None:
             batch["delta_ts"],
             batch["hints"],
             batch["attempts"],
-            batch["mask"],
+            watch_ratio_seq=batch.get("watch_ratios"),
+            is_replay_seq=batch.get("is_replays"),
+            mask=batch["mask"],
         )
 
         for i, student_id in enumerate(student_ids):
@@ -67,15 +101,29 @@ def main() -> None:
                 }
             student_states[student_id] = states_for_student
 
-    with STATE_PATH.open("wb") as f:
+    if args.dataset == "mooc":
+        state_name = "student_states_mooc.pkl"
+    elif args.dataset == "2017":
+        state_name = "student_states_2017.pkl"
+    else:
+        state_name = "student_states.pkl"
+    state_path = ds_dir / state_name
+    with state_path.open("wb") as f:
         pickle.dump(student_states, f)
 
+    if args.dataset == "mooc":
+        eval_name = "eval_results_mooc.pkl"
+    elif args.dataset == "2017":
+        eval_name = "eval_results_2017.pkl"
+    else:
+        eval_name = "eval_results.pkl"
+    eval_path = ds_dir / eval_name
     auc, acc = evaluate_model(model, loader, device)
-    with EVAL_PATH.open("wb") as f:
+    with eval_path.open("wb") as f:
         pickle.dump({"AUC": float(auc), "ACC": float(acc)}, f)
 
-    print(f"[export_states] 已导出学生状态: {STATE_PATH}")
-    print(f"[export_states] 已保存模型评估: {EVAL_PATH}")
+    print(f"[export_states] 已导出学生状态: {state_path}")
+    print(f"[export_states] 已保存模型评估: {eval_path}")
     print(f"[export_states] 学生数: {len(student_states)}")
 
 

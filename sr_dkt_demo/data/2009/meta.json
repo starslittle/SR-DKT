@@ -1,0 +1,8 @@
+{
+  "num_students": 3884,
+  "num_kc": 123,
+  "avg_seq_len": 118.11688980432544,
+  "train_students": 3107,
+  "val_students": 388,
+  "test_students": 389
+}

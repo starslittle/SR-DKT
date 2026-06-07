@@ -7,6 +7,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 from torch.nn import functional as F
+from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 
 
 class SRDKT(nn.Module):
@@ -27,10 +28,15 @@ class SRDKT(nn.Module):
         self.hidden_size = hidden_size
         self.num_layers = num_layers
 
-        # Storage分支输入：kc_one_hot + correct + delta_t + attempt + hint
-        storage_input_size = num_kc + 4
-        # Retrieval分支输入：kc_one_hot + watch_ratio + delta_t + is_replay
-        retrieval_input_size = num_kc + 3
+        # KC Embedding：替代 one-hot，输入维度与 KC 数量解耦
+        # +1 是为了容纳 OTHER 类（kc_id = num_kc）
+        self.kc_embed_s = nn.Embedding(num_kc + 1, hidden_size, padding_idx=0)
+        self.kc_embed_r = nn.Embedding(num_kc + 1, hidden_size, padding_idx=0)
+
+        # Storage分支输入：kc_embed(128) + correct + delta_t + attempt + hint
+        storage_input_size = hidden_size + 4
+        # Retrieval分支输入：kc_embed(128) + watch_ratio + delta_t + is_replay
+        retrieval_input_size = hidden_size + 3
 
         # 双路径LSTM，参数完全独立
         self.lstm_s = nn.LSTM(
@@ -62,9 +68,6 @@ class SRDKT(nn.Module):
         # 最终预测头：输入 h_final（hidden_size）-> P(correct)
         self.fc_pred = nn.Linear(hidden_size, 1)
 
-        # 融合后的线性映射（用于消融实验中的shared LSTM）
-        self.fc_fusion = nn.Linear(hidden_size * 2, hidden_size)
-
     @property
     def lambda_s(self) -> torch.Tensor:
         """Storage遗忘速率，保证为正值"""
@@ -85,15 +88,15 @@ class SRDKT(nn.Module):
         attempts_seq: torch.Tensor,    # (B, T)
     ) -> torch.Tensor:
         """编码 Storage 分支输入特征"""
-        kc_ids = sequences[..., 0].long().clamp(min=0)
+        kc_ids = sequences[..., 0].long().clamp(min=0, max=self.num_kc)
         corrects = sequences[..., 1].float()
-        kc_one_hot = F.one_hot(kc_ids, num_classes=self.num_kc).float()
+        kc_emb = self.kc_embed_s(kc_ids)  # (B, T, hidden_size)
         delta_norm = (torch.log1p(delta_t_seq.float().clamp(min=0)) /
                       torch.log1p(torch.tensor(30.0, device=delta_t_seq.device)))
         hint_norm = hints_seq.float().clamp(0, 5) / 5.0
         attempt_norm = attempts_seq.float().clamp(0, 3) / 3.0
         return torch.cat([
-            kc_one_hot,
+            kc_emb,
             corrects.unsqueeze(-1),
             delta_norm.unsqueeze(-1),
             hint_norm.unsqueeze(-1),
@@ -108,14 +111,14 @@ class SRDKT(nn.Module):
         is_replay_seq: torch.Tensor,   # (B, T) 是否回放 0/1
     ) -> torch.Tensor:
         """编码 Retrieval 分支输入特征"""
-        kc_ids = sequences[..., 0].long().clamp(min=0)
-        kc_one_hot = F.one_hot(kc_ids, num_classes=self.num_kc).float()
+        kc_ids = sequences[..., 0].long().clamp(min=0, max=self.num_kc)
+        kc_emb = self.kc_embed_r(kc_ids)  # (B, T, hidden_size)
         delta_norm = (torch.log1p(delta_t_seq.float().clamp(min=0)) /
                       torch.log1p(torch.tensor(30.0, device=delta_t_seq.device)))
         watch = watch_ratio_seq.float().clamp(0, 1)
         replay = is_replay_seq.float().clamp(0, 1)
         return torch.cat([
-            kc_one_hot,
+            kc_emb,
             delta_norm.unsqueeze(-1),
             watch.unsqueeze(-1),
             replay.unsqueeze(-1),
@@ -177,7 +180,16 @@ class SRDKT(nn.Module):
 
         # ---- Storage 分支 ----
         x_s = self.encode_storage_inputs(sequences, delta_t_seq, hints_seq, attempts_seq)
-        h_s, _ = self.lstm_s(x_s)  # (B, T, hidden)
+
+        # 如果有 mask，用 pack_padded_sequence 避免 padding 污染 LSTM 隐状态
+        if mask is not None:
+            lengths = mask.sum(dim=1).clamp(min=1).long().cpu()
+            x_s_packed = pack_padded_sequence(x_s, lengths, batch_first=True, enforce_sorted=False)
+            h_s_packed, _ = self.lstm_s(x_s_packed)
+            h_s, _ = pad_packed_sequence(h_s_packed, batch_first=True, total_length=T)
+        else:
+            h_s, _ = self.lstm_s(x_s)
+
         s_seq = torch.sigmoid(self.fc_S(h_s))  # (B, T, 1)
 
         # ---- 单路径退化：等价于DKT-F，只用Storage路径 ----
@@ -191,7 +203,16 @@ class SRDKT(nn.Module):
             h_r = torch.zeros(B, T, self.hidden_size, device=device)
         else:
             x_r = self.encode_retrieval_inputs(sequences, delta_t_seq, watch_ratio_seq, is_replay_seq)
-            h_r, _ = self.lstm_r(x_r)  # (B, T, hidden)
+
+            # 同样对 Retrieval LSTM 使用 pack_padded_sequence
+            if mask is not None:
+                lengths_r = mask.sum(dim=1).clamp(min=1).long().cpu()
+                x_r_packed = pack_padded_sequence(x_r, lengths_r, batch_first=True, enforce_sorted=False)
+                h_r_packed, _ = self.lstm_r(x_r_packed)
+                h_r, _ = pad_packed_sequence(h_r_packed, batch_first=True, total_length=T)
+            else:
+                h_r, _ = self.lstm_r(x_r)
+
             r_raw = torch.sigmoid(self.fc_R(h_r))  # (B, T, 1)
 
         # ---- 差异化遗忘衰减 ----

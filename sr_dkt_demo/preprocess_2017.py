@@ -147,7 +147,12 @@ def main() -> None:
 
     encoder = LabelEncoder()
     df["kc_id"] = encoder.fit_transform(df["skill_id"].astype(str))
-    save_pickle(encoder, DATA_DIR / "skill_encoder_2017.pkl")
+
+    # 输出到 data/2017/ 子目录
+    out_dir = DATA_DIR / "2017"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    save_pickle(encoder, out_dir / "skill_encoder_2017.pkl")
     print(f"[preprocess_2017] 已保存 skill_encoder_2017.pkl，知识点数: {len(encoder.classes_)}")
 
     counts = df.groupby("student_id").size()
@@ -157,9 +162,9 @@ def main() -> None:
 
     sequences = build_sequences(df)
     train, val, test = split_by_student(sequences)
-    save_pickle(train, DATA_DIR / "train_2017.pkl")
-    save_pickle(val, DATA_DIR / "val_2017.pkl")
-    save_pickle(test, DATA_DIR / "test_2017.pkl")
+    save_pickle(train, out_dir / "train_2017.pkl")
+    save_pickle(val, out_dir / "val_2017.pkl")
+    save_pickle(test, out_dir / "test_2017.pkl")
 
     lengths = [len(seq) for seq in sequences.values()]
     stats = {
@@ -170,7 +175,7 @@ def main() -> None:
         "val_students": len(val),
         "test_students": len(test),
     }
-    (DATA_DIR / "meta_2017.json").write_text(
+    (out_dir / "meta_2017.json").write_text(
         json.dumps(stats, ensure_ascii=False, indent=2), encoding="utf-8"
     )
 

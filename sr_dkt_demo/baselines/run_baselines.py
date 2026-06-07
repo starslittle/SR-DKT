@@ -60,6 +60,13 @@ CKPT_DIR = DATA_DIR / "ckpt"
 LOG_PATH = DATA_DIR / "training_logs.json"
 
 
+def get_dataset_dir(dataset: str) -> Path:
+    """根据数据集名称返回对应的子目录"""
+    if dataset == "mooc":
+        return DATA_DIR / "mooc"
+    return DATA_DIR / ("2017" if dataset == "2017" else "2009")
+
+
 def set_seed(seed: int = 42) -> None:
     """固定随机种子"""
     random.seed(seed)
@@ -107,12 +114,14 @@ def forward_model(model: nn.Module, model_name: str, batch: dict) -> torch.Tenso
     mask = batch["mask"]
 
     if model_name == "SR-DKT":
-        # SR-DKT 使用完整输入，包括 hints 和 attempts
+        # SR-DKT 使用完整输入，包括 hints、attempts 和视频特征
         preds, _, _ = model(
             batch["sequences"],
             batch["delta_ts"],
             batch["hints"],
             batch["attempts"],
+            watch_ratio_seq=batch.get("watch_ratios"),
+            is_replay_seq=batch.get("is_replays"),
             mask=batch["mask"],
         )
         return preds
@@ -151,10 +160,22 @@ def forward_model(model: nn.Module, model_name: str, batch: dict) -> torch.Tenso
     return preds
 
 
-def sequence_loss(preds: torch.Tensor, corrects: torch.Tensor, mask: torch.Tensor, criterion) -> torch.Tensor:
-    """计算下一步预测损失"""
+def sequence_loss(preds: torch.Tensor, corrects: torch.Tensor, mask: torch.Tensor, criterion,
+                  model_name: str = "") -> torch.Tensor:
+    """计算下一步预测损失
+
+    DKVMN 特殊处理：read-before-write 语义，preds[t] 预测 corrects[t] 而非 corrects[t+1]。
+    因此 DKVMN 的损失对齐方式为 preds[:, 1:] vs corrects[:, 1:]（跳过位置0）。
+    """
     if preds.shape[1] < 2:
         return torch.tensor(0.0, device=preds.device, requires_grad=True)
+
+    if model_name == "DKVMN":
+        # DKVMN: read(q_t) → pred(r_t) → write(q_t, r_t), preds[t]→corrects[t]
+        valid = mask[:, 1:]
+        return criterion(preds[:, 1:, 0][valid], corrects[:, 1:][valid].float())
+
+    # Default (DKT/SAKT/AKT/LBKT/BEKT/SR-DKT): preds[t]→corrects[t+1]
     valid = mask[:, 1:]
     return criterion(preds[:, :-1, 0][valid], corrects[:, 1:][valid].float())
 
@@ -175,8 +196,13 @@ def evaluate(model: nn.Module, model_name: str, loader: DataLoader, device: torc
         if preds.shape[1] < 2:
             continue
         valid = batch["mask"][:, 1:]
-        y_true.extend(batch["corrects"][:, 1:][valid].detach().cpu().numpy().tolist())
-        y_pred.extend(preds[:, :-1, 0][valid].detach().cpu().numpy().tolist())
+        # DKVMN: preds[t]→corrects[t], other models: preds[t]→corrects[t+1]
+        if model_name == "DKVMN":
+            y_true.extend(batch["corrects"][:, 1:][valid].detach().cpu().numpy().tolist())
+            y_pred.extend(preds[:, 1:, 0][valid].detach().cpu().numpy().tolist())
+        else:
+            y_true.extend(batch["corrects"][:, 1:][valid].detach().cpu().numpy().tolist())
+            y_pred.extend(preds[:, :-1, 0][valid].detach().cpu().numpy().tolist())
 
     if not y_true:
         return {"AUC": 0.5, "ACC": 0.0, "F1": 0.0}
@@ -235,7 +261,7 @@ def train_one_model(
             preds = forward_model(model, model_name, batch)
 
             # 计算 BCE 损失
-            bce_loss = sequence_loss(preds, batch["corrects"], batch["mask"], criterion)
+            bce_loss = sequence_loss(preds, batch["corrects"], batch["mask"], criterion, model_name)
 
             # SR-DKT 需要额外加 lambda 约束损失
             if model_name == "SR-DKT":
@@ -301,9 +327,11 @@ def print_results(results: dict[str, dict[str, float]], dataset: str = "2009") -
     DKT    | ... | ... | ...
     SR-DKT | ... | ... | ...
     """
+    dataset_labels = {"2009": "ASSISTments 2009", "2017": "ASSISTments 2017", "mooc": "MOOCCubeX"}
+    ds_name = dataset_labels.get(dataset, dataset)
     best_name = max(results, key=lambda name: results[name]["AUC"])
     print("=" * 50)
-    print(f"模型对比实验结果（ASSISTments {dataset}）")
+    print(f"模型对比实验结果（{ds_name}）")
     print("=" * 50)
     print(f"{'模型':<10}{'AUC':>8}{'ACC':>8}{'F1':>8}")
     print("-" * 50)
@@ -317,28 +345,36 @@ def print_results(results: dict[str, dict[str, float]], dataset: str = "2009") -
 def main() -> None:
     """主函数：批量训练所有 baseline 模型"""
     parser = argparse.ArgumentParser(description="SR-DKT Baselines Runner")
-    parser.add_argument("--dataset", default="2009", choices=["2009", "2017"],
+    parser.add_argument("--dataset", default="2009", choices=["2009", "2017", "mooc"],
                         help="选择数据集: 2009 或 2017")
     args = parser.parse_args()
 
     set_seed(CONFIG["seed"])
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[baselines] 使用设备: {device}")
-    print(f"[baselines] 数据集: ASSISTments {args.dataset}")
+    dataset_label = {"2009": "ASSISTments 2009", "2017": "ASSISTments 2017", "mooc": "MOOCCubeX"}.get(args.dataset, args.dataset)
+    print(f"[baselines] 数据集: {dataset_label}")
 
     # 加载数据
+    ds_dir = get_dataset_dir(args.dataset)
     if args.dataset == "2017":
-        train_data = load_pickle(DATA_DIR / "train_2017.pkl")
-        val_data = load_pickle(DATA_DIR / "val_2017.pkl")
-        test_data = load_pickle(DATA_DIR / "test_2017.pkl")
-        meta_path = DATA_DIR / "meta_2017.json"
-        result_path = DATA_DIR / "baseline_results_2017.json"
+        train_data = load_pickle(ds_dir / "train_2017.pkl")
+        val_data = load_pickle(ds_dir / "val_2017.pkl")
+        test_data = load_pickle(ds_dir / "test_2017.pkl")
+        meta_path = ds_dir / "meta_2017.json"
+        result_path = ds_dir / "baseline_results_2017.json"
+    elif args.dataset == "mooc":
+        train_data = load_pickle(ds_dir / "train.pkl")
+        val_data = load_pickle(ds_dir / "val.pkl")
+        test_data = load_pickle(ds_dir / "test.pkl")
+        meta_path = ds_dir / "meta_mooc.json"
+        result_path = ds_dir / "baseline_results_mooc.json"
     else:
-        train_data = load_pickle(DATA_DIR / "train.pkl")
-        val_data = load_pickle(DATA_DIR / "val.pkl")
-        test_data = load_pickle(DATA_DIR / "test.pkl")
-        meta_path = DATA_DIR / "meta.json"
-        result_path = DATA_DIR / "baseline_results.json"
+        train_data = load_pickle(ds_dir / "train.pkl")
+        val_data = load_pickle(ds_dir / "val.pkl")
+        test_data = load_pickle(ds_dir / "test.pkl")
+        meta_path = ds_dir / "meta.json"
+        result_path = ds_dir / "baseline_results.json"
 
     num_kc = int(json.loads(meta_path.read_text(encoding="utf-8"))["num_kc"])
     print(f"[baselines] 知识点数量: {num_kc}")
