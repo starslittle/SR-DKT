@@ -159,6 +159,7 @@ class SRDKT(nn.Module):
             mask: (B, T) 可选，有效位置掩码
             ablation_mode: 消融模式
                 'full'          - 完整模型
+                'no_storage'    - 去掉Storage分支（S固定0.5）
                 'no_retrieval'  - 去掉Retrieval分支
                 'shared_decay'  - 共享遗忘速率
                 'no_attention'  - 简单平均融合
@@ -179,18 +180,23 @@ class SRDKT(nn.Module):
             is_replay_seq = torch.zeros(B, T, device=device)
 
         # ---- Storage 分支 ----
-        x_s = self.encode_storage_inputs(sequences, delta_t_seq, hints_seq, attempts_seq)
-
-        # 如果有 mask，用 pack_padded_sequence 避免 padding 污染 LSTM 隐状态
-        if mask is not None:
-            lengths = mask.sum(dim=1).clamp(min=1).long().cpu()
-            x_s_packed = pack_padded_sequence(x_s, lengths, batch_first=True, enforce_sorted=False)
-            h_s_packed, _ = self.lstm_s(x_s_packed)
-            h_s, _ = pad_packed_sequence(h_s_packed, batch_first=True, total_length=T)
+        if ablation_mode == 'no_storage':
+            # 去掉 Storage，S 固定为 0.5
+            s_seq = torch.full((B, T, 1), 0.5, device=device)
+            h_s = torch.zeros(B, T, self.hidden_size, device=device)
         else:
-            h_s, _ = self.lstm_s(x_s)
+            x_s = self.encode_storage_inputs(sequences, delta_t_seq, hints_seq, attempts_seq)
 
-        s_seq = torch.sigmoid(self.fc_S(h_s))  # (B, T, 1)
+            # 如果有 mask，用 pack_padded_sequence 避免 padding 污染 LSTM 隐状态
+            if mask is not None:
+                lengths = mask.sum(dim=1).clamp(min=1).long().cpu()
+                x_s_packed = pack_padded_sequence(x_s, lengths, batch_first=True, enforce_sorted=False)
+                h_s_packed, _ = self.lstm_s(x_s_packed)
+                h_s, _ = pad_packed_sequence(h_s_packed, batch_first=True, total_length=T)
+            else:
+                h_s, _ = self.lstm_s(x_s)
+
+            s_seq = torch.sigmoid(self.fc_S(h_s))  # (B, T, 1)
 
         # ---- 单路径退化：等价于DKT-F，只用Storage路径 ----
         if ablation_mode == 'single_path':
@@ -237,6 +243,9 @@ class SRDKT(nn.Module):
         if ablation_mode == 'no_attention':
             # 简单平均融合
             h_fused_raw = 0.5 * h_s + 0.5 * h_r
+        elif ablation_mode == 'no_storage':
+            # 只用 Retrieval
+            h_fused_raw = h_r
         elif ablation_mode == 'no_retrieval':
             # 只用Storage
             h_fused_raw = h_s

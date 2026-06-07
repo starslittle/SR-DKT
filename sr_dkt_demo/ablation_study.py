@@ -264,10 +264,11 @@ def main() -> None:
         collate_fn=collate_recent_batch,
     )
 
-    # 5 组消融配置，每个配置创建一个新模型实例
+    # 6 组消融配置，每个配置创建一个新模型实例
     # 必须为每个配置创建独立模型，防止权重继承影响
     ablation_configs = [
         ("Full SR-DKT",     'full'),
+        ("w/o Storage",     'no_storage'),
         ("w/o Retrieval",   'no_retrieval'),
         ("w/o 差异化遗忘",  'shared_decay'),
         ("w/o 注意力融合",  'no_attention'),
