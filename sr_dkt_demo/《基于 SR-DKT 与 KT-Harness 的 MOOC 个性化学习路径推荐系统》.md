@@ -1614,3 +1614,130 @@ O(1)
 2. 设计一种基于双状态的学习动作推荐机制，将认知状态用于动作选择与资源映射；
 3. 引入基于真实后续行为和 `ΔKS` 的双层验证机制与 SM-2 复习调度，实现推荐策略的迭代优化；
 4. 在公开 MOOC 数据集上通过 SR-DKT 预测实验、动作推荐对比实验和反事实收敛实验验证系统有效性。
+
+---
+
+## 18. 实际实验设置（2026-06-09 更新）
+
+### 18.1 数据集处理
+
+| 配置项 | 值 | 说明 |
+|--------|-----|------|
+| 数据集 | MOOCCubeX | 清华大学 学堂在线 |
+| 原始学生数 | 3,330,294 | 全量注册用户 |
+| 原始行为记录 | 2.96 亿条 | 全量学习行为 |
+| 预处理后 KC 数 | 30,001 | top-30000 KC + OTHER 类 |
+| 预处理交互数 | ~133M | 筛选有效行为后 |
+| 序列格式 | 7 元组 | `(kc_id, correct, delta_t, hint, attempt, watch_ratio, is_replay)` |
+| 视频特征覆盖率 | ~9.5% | watch_ratio / is_replay 非零占比 |
+
+#### 训练集采样策略
+
+为了在合理算力下完成多组对比实验，本文采用 **20% 分层采样 + 完整评估集** 的数据策略：
+
+| 配置项 | 值 | 说明 |
+|--------|-----|------|
+| 训练集 | 192,091 名学生 | 20% 分层采样 |
+| 验证集 | 完整 | 全量（未采样） |
+| 测试集 | 完整 | 全量（未采样） |
+| 采样方法 | 分层采样 | 按序列长度 + 正确率分层 |
+| KC 覆盖补偿 | 已补齐 | 缺失知识点补零，覆盖率 100% |
+| 采样种子 | 2026 | 保证可复现 |
+| 数据目录 | `data/mooc_20p_full_eval` | 软链接至 `data/mooc` |
+
+采用 20% 训练子集 + 全量验证评估的方式，既控制了实验算力成本（单卡 RTX 4090D 约 6h 完成一组完整实验），又保证了评估结果的统计可靠性（全量测试集覆盖所有学生）。KC 覆盖补偿确保了模型不会因训练集缩小而产生知识点盲区。
+
+### 18.2 模型训练配置
+
+| 配置项 | 值 | 说明 |
+|--------|-----|------|
+| hidden_size | 128 | LSTM / Transformer 隐层维度 |
+| max_seq_len | 200 | 超长序列截断 |
+| batch_size | 128 | 训练批次大小 |
+| epochs | 50 | 最大训练轮数 |
+| patience | 8 | Early stopping 耐心值 |
+| optimizer | Adam | lr 按模型独立设置 |
+| lambda_constraint_weight | 0.01 | λ 约束损失权重 |
+
+#### 模型独立学习率
+
+| 模型 | 学习率 | 原因 |
+|------|--------|------|
+| DKT / DKT-F | 1e-3 | LSTM 类模型标准 |
+| DKVMN | 1e-3 | Memory 网络稳定 |
+| LBKT | 1e-3 | 带行为门控的 attention |
+| SR-DKT | 1e-3 | 双路径 LSTM |
+| SAKT | 5e-4 | Transformer 需要较小学习率 |
+| BEKT | 5e-4 | 双编码器 Transformer |
+| AKT | 1e-4 | 双 Transformer + 距离感知注意力，最敏感 |
+
+### 18.3 基线模型对齐说明
+
+本文实现了 7 个基线模型用于对比实验。其中 SAKT 和 AKT 的实现与原始论文做了对齐审计：
+
+| 模型 | 论文年份 | 对齐状态 | 说明 |
+|------|---------|---------|------|
+| DKT | 2015 | ✅ 等价 | LSTM + Embedding，输入维度差异化 |
+| DKT-F | 2019 | ✅ 等价 | LSTMCell + 时间衰减 |
+| DKVMN | 2017 | ✅ 等价 | Key-Value Memory + read/write |
+| LBKT | 2021 | ✅ 等价 | Self-attention + behavior gate |
+| BEKT | 2026 | ✅ 等价 | Dual encoder + 时间衰减检索 + 行为波动 |
+| SAKT | 2019 | ✅ 对齐 | Cross-attention (Q=next exercise, K/V=history)，pyKT 兼容 |
+| AKT | 2020 | ✅ 对齐 | 双 Transformer (QA 编码器 + 问题解码器交替自/交叉注意力)，距离感知 per-head gamma 指数衰减，3 层 MLP 跳跃连接。Rasch 难度省略（akt_cid 变体，因 MOOCCubeX 无 problem-id） |
+
+### 18.4 消融实验配置
+
+本文设计了 6 组消融实验，验证 SR-DKT 各核心组件的独立贡献：
+
+| 消融模式 | 代码标识 | 验证问题 |
+|---------|---------|---------|
+| Full SR-DKT | `full` | 完整模型上限 |
+| w/o Storage | `no_storage` | 去掉 Storage LSTM（S 固定 0.5），只用 Retrieval |
+| w/o Retrieval | `no_retrieval` | 去掉 Retrieval LSTM，只用 Storage |
+| w/o 差异化遗忘 | `shared_decay` | λ_s = λ_r，取消差异化遗忘 |
+| w/o 注意力融合 | `no_attention` | 0.5×S + 0.5×R 简单平均，不加权 |
+| 单路径退化 | `single_path` | 只用一条 LSTM，等价退化版 DKT |
+
+前 3 项验证结构创新（双路径），后 3 项验证机制创新（差异化遗忘 + 注意力融合 + 双路径必要性）。
+
+### 18.5 算力环境
+
+| 配置项 | 值 |
+|--------|-----|
+| GPU | RTX 4090D 24GB |
+| 平台 | AutoDL 云 GPU |
+| 镜像 | PyTorch 2.3.0 / CUDA 12.1 / Python 3.11 |
+| 单次训练耗时 | SR-DKT ~6h / AKT ~8h / DKT ~2h |
+| 总实验耗时 | ~15-20h（20% 子集 + 6 组消融 + 7 基线） |
+
+### 18.6 实验矩阵
+
+本文完整实验流程：
+
+```
+实验一：SR-DKT 主模型训练
+   │  train.py --dataset mooc
+   │  输出: AUC / ACC / F1 + best_model_mooc.pt
+   ▼
+实验二：7 基线对比
+   │  baselines/run_baselines.py --dataset mooc
+   │  输出: 8 模型 AUC / ACC 对比表
+   ▼
+实验三：6 组消融
+   │  ablation_study.py --dataset mooc
+   │  输出: 6 配置 AUC / ACC 对比表 + 组件贡献图
+   ▼
+实验四：KT-Harness 推荐评估
+      evaluate.py --dataset mooc
+      输出: 模型层 AUC/ACC + 推荐层 WCG/HR@10/NDCG@10
+```
+
+### 18.7 与论文方案的关系
+
+| 论文方案 | 实际实现 | 差异说明 |
+|---------|---------|---------|
+| 全量 MOOCCubeX 训练 | 20% 训练子集 + 全量评估 | 算力受限，论文标注采样策略 |
+| 行为选择性处理 | 特征差异化双路径 | 简洁且等价的设计，论文第三章节描述对齐 |
+| Retrieval 输入含 7 个视频特征 | 实际 2 个（watch_ratio, is_replay） | MOOCCubeX 其他字段大量缺失，标注为局限 |
+| SM-2 调度模块 | 第四章系统设计，未编码实现 | 见第 6.4 节关系分析 |
+| 反事实迭代收敛实验 | 标注为未来工作 | 当前聚焦 SR-DKT 模型创新验证 |
