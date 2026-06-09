@@ -346,7 +346,10 @@ def main() -> None:
     """主函数：批量训练所有 baseline 模型"""
     parser = argparse.ArgumentParser(description="SR-DKT Baselines Runner")
     parser.add_argument("--dataset", default="2009", choices=["2009", "2017", "mooc"],
-                        help="选择数据集: 2009 或 2017")
+                        help="选择数据集: 2009, 2017 或 mooc")
+    parser.add_argument("--model", default=None,
+                        choices=["DKT", "DKT-F", "SAKT", "AKT", "LBKT", "DKVMN", "BEKT", "SR-DKT"],
+                        help="指定单个模型名（不指定则跑全部 8 个）")
     args = parser.parse_args()
 
     set_seed(CONFIG["seed"])
@@ -406,10 +409,15 @@ def main() -> None:
         "SAKT":   SAKT(num_kc, CONFIG["hidden_size"]),
         "AKT":    AKT(num_kc, CONFIG["hidden_size"]),
         "LBKT":   LBKT(num_kc, CONFIG["hidden_size"]),
-        "DKVMN":  DKVMN(num_kc, CONFIG["hidden_size"]),   # 新增
-        "BEKT":   BEKT(num_kc, CONFIG["hidden_size"]),    # 新增
+        "DKVMN":  DKVMN(num_kc, CONFIG["hidden_size"]),
+        "BEKT":   BEKT(num_kc, CONFIG["hidden_size"]),
         "SR-DKT": SRDKT(num_kc, CONFIG["hidden_size"]),
     }
+
+    # 支持 --model 参数，只训练指定模型（便于并行跑多个 screen）
+    if args.model:
+        model_configs = {args.model: model_configs[args.model]}
+        print(f"[baselines] 单模型模式: {args.model}")
 
     # 逐个训练
     results = {}
@@ -421,7 +429,11 @@ def main() -> None:
             name, model, train_loader, val_loader, test_loader, device
         )
 
-    # 保存结果
+    # 保存结果（合并已有结果，支持并行跑时共享 result_path）
+    if result_path.exists():
+        existing = json.loads(result_path.read_text(encoding="utf-8"))
+        existing.update(results)
+        results = existing
     result_path.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"\n[baselines] 已保存结果: {result_path}")
 
