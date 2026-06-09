@@ -1741,3 +1741,143 @@ O(1)
 | Retrieval 输入含 7 个视频特征 | 实际 2 个（watch_ratio, is_replay） | MOOCCubeX 其他字段大量缺失，标注为局限 |
 | SM-2 调度模块 | 第四章系统设计，未编码实现 | 见第 6.4 节关系分析 |
 | 反事实迭代收敛实验 | 标注为未来工作 | 当前聚焦 SR-DKT 模型创新验证 |
+
+---
+
+## 19. MOOCCubeX 数据集与预处理详解
+
+### 19.1 数据来源与原始规模
+
+MOOCCubeX 由清华大学知识工程实验室（THU-KEG）发布，基于学堂在线平台的真实 MOOC 学习行为数据。原始数据为 JSON 行格式，每个文件一行一个 JSON 对象。
+
+| 数据类型 | 文件 | 大小 | 记录数 | 说明 |
+|---------|------|------|--------|------|
+| 用户做题记录 | `relations/user-problem.json` | 22.5 GB | ~1.33 亿条 | 每行一个学生的一道题作答 |
+| 用户视频观看 | `relations/user-video.json` | 3.2 GB | ~31 万条 | 每行一个学生对一个视频的观看片段 |
+| 问题元数据 | `entities/problem.json` | 1.3 GB | — | 包含 `problem_id` → `exercise_id` 映射 |
+| 视频信息 | `entities/video.json` | 608 MB | 230,263 个 | 视频总时长、片段标识 |
+| 问题-练习映射 | `relations/exercise-problem.txt` | — | ~99.95% 覆盖率 | Tab 分隔，`Ex_XXXXX\tPm_XXXXX` |
+| 视频 ID 桥接 | `relations/video_id-ccid.txt` | — | — | `V_XXXXX` ↔ hex ccid 映射 |
+
+### 19.2 预处理流水线（6 步）
+
+预处理脚本 `preprocess_mooc.py` 将上述 44GB 原始 JSON 转换为 6GB 的 pickle 训练文件：
+
+```
+Step 1: 加载 problem_id → exercise_id 映射
+   ├─ 主源: relations/exercise-problem.txt (覆盖率 ~99.95%)
+   └─ 补充: entities/problem.json (补充缺失)
+
+Step 1.5: 加载 video_id → ccid 映射
+   └─ V_XXXXX ↔ hex ccid: 桥接两种 ID 体系
+
+Step 2: 加载视频时长索引
+   └─ entities/video.json → {ccid: total_duration}
+
+Step 3: 处理用户视频数据
+   ├─ 读取 relations/user-video.json
+   ├─ 计算 watch_ratio = 观看时长 / 视频总时长
+   ├─ 检测 is_replay: 多片段按 start_point 排序后判断重叠
+   └─ 输出: {user_id: [(video_id, watch_ratio, is_replay, last_epoch)]}
+
+Step 4: 流式加载做题数据
+   ├─ 流式读取 relations/user-problem.json (chunk_size=5M)
+   ├─ 解析: problem_id → exercise_id, is_correct, attempts, submit_time
+   ├─ 用 numpy 结构化数组存储: dtype=[pid, epoch, correct, attempt]
+   └─ 24GB 内存 → 在 32GB 机器上可运行
+
+Step 4.5: Top-K KC 过滤
+   ├─ 按出现频率排序，保留 top-N exercise_id
+   ├─ 其余映射为 "OTHER" 类
+   └─ --max-kc 30000 时，OTHER 占比 ~15.3%
+
+Step 5: 构建序列
+   ├─ 按时间戳排序 + 计算 delta_t (天)
+   ├─ 二分查找匹配视频特征 (epoch ≤ 做题时间)
+   ├─ 输出 7 元组: (kc_id, correct, delta_t, hint, attempt, watch_ratio, is_replay)
+   └─ 就地编码: exercise_id → LabelEncoder → kc_id 整数
+
+Step 6: 划分 & 保存
+   ├─ 过滤 min_interactions ≥ 3 的学生
+   ├─ 80/10/10 划分 train/val/test
+   └─ 输出: train.pkl / val.pkl / test.pkl + meta_mooc.json + skill_encoder_mooc.pkl
+```
+
+### 19.3 内存优化措施
+
+考虑到 44GB 原始数据在 32GB 内存环境下处理，预处理采用了多项优化：
+
+| 优化 | 说明 | 效果 |
+|------|------|------|
+| 流式读取 | user-problem.json 逐行 JSON 解析，不一次性加载 | 避免 22.5GB 全量加载 |
+| numpy 结构化数组 | 交互记录用 `np.dtype([(pid,i64),(epoch,f64),(correct,i1),(attempt,i2)])` | 单条记录 22B，比 Python dict 省 5-10x 内存 |
+| 就地编码 | Step 6 直接修改 tuple 字段，不创建副本 | 避免 2x 内存峰值 |
+| 及时释放 | 每个 Step 完成后 `del` 中间变量 | 控制峰值在 ~22GB |
+| 字节级解析 | exercise-problem.txt 用 `rb` 模式 + 逐字节找 Tab | 避免 UTF-8 解码错误 |
+
+总耗时约 64 分钟，内存峰值约 22GB。
+
+### 19.4 输出序列格式
+
+预处理后的 `train/val/test.pkl` 为 Python dict：
+
+```python
+{
+    "user_0001": [
+        (kc_id, correct, delta_t, hint, attempt, watch_ratio, is_replay),
+        (kc_id, correct, delta_t, hint, attempt, watch_ratio, is_replay),
+        ...
+    ],
+    "user_0002": [...],
+    ...
+}
+```
+
+| 字段 | 类型 | 值域 | 含义 |
+|------|------|------|------|
+| `kc_id` | int | 0 ～ 30,000 | LabelEncoder 编码后的知识点 ID（OTHER=30000） |
+| `correct` | int | 0 / 1 | 该题是否答对 |
+| `delta_t` | float | ≥ 0 | 距上一次交互的天数 |
+| `hint` | float | 0 | MOOC 无 hint 信息，恒为 0 |
+| `attempt` | float | ≥ 1 | 尝试次数 |
+| `watch_ratio` | float | [0, 1] | 观看比例 = 观看时长 / 视频总时长（25.4s 压缩为 log1p(∆t/30)） |
+| `is_replay` | int | 0 / 1 | 是否存在回放片段 |
+
+### 19.5 视频特征提取详解
+
+这是 SR-DKT Retrieval 分支的核心输入。提取流程：
+
+1. **观看比例**（`watch_ratio`）：对每段视频的所有 `segment` 累加 `end_point - start_point`，除以视频总时长，截断到 [0, 1]。
+2. **回放检测**（`is_replay`）：将所有 segment 按 `start_point` 排序，若存在相邻片段 `curr_start < prev_end`，则判定为回放。
+3. **时间匹配**：对每个学生的做题记录按 epoch 排序，对每次做题使用二分查找定位该时间戳之前最近一次视频观看，将其 `watch_ratio` 和 `is_replay` 注入对应的序列位置。
+
+最终视频特征覆盖率约 **9.5%**（即约 9.5% 的交互带有 watch_ratio > 0 或 is_replay > 0）。这部分数据是 SR-DKT 验证"被动行为影响 Retrieval 状态"信号的关键。
+
+### 19.6 全量数据集统计
+
+| 统计量 | 值 |
+|--------|-----|
+| 总学生数 | ~960,000 |
+| 总交互数 | ~133,000,000 |
+| 知识点数（含 OTHER） | 30,001 |
+| 平均序列长度 | ~138 |
+| 中位数序列长度 | ~95 |
+| 最短 / 最长序列 | 3 / >10,000 |
+| 训练集占比 | 80%（~768K 学生） |
+| 验证集占比 | 10%（~96K 学生） |
+| 测试集占比 | 10%（~96K 学生） |
+| 视频特征覆盖率 | ~9.5% |
+
+### 19.7 训练子集（20% 分层采样）
+
+为了在合理算力下完成多组对比实验，从全量训练集中抽取 20% 分层子集：
+
+| 配置 | 值 |
+|------|-----|
+| 采样比例 | 20% |
+| 训练集学生数 | 192,091 |
+| 采样方法 | 按序列长度 + 正确率分层采样 |
+| KC 覆盖补偿 | 对缺失 KC 补零，覆盖率 100% |
+| 采样种子 | 2026 |
+| 验证/测试集 | 全量（未采样） |
+| 子集目录 | `data/mooc_20p_full_eval` |
