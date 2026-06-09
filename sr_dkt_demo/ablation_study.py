@@ -28,10 +28,10 @@ from train import SequenceDataset, collate_batch, move_batch
 
 CONFIG = {
     "hidden_size": 128,
-    "batch_size": 64,
+    "batch_size": 128,
     "lr": 0.001,
-    "epochs": 100,
-    "patience": 10,
+    "epochs": 50,
+    "patience": 8,
     "seed": 42,
     "max_seq_len": 200,
     "lambda_constraint_weight": 0.01,

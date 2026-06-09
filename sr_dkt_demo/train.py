@@ -2,7 +2,8 @@
 # 已修复 Bug 2：evaluate_model 和 train_sr_dkt 中 mask 参数位置错误
 # 作者：SR-DKT 项目组
 # 日期：2026-05-11
-# 训练配置：batch_size=64, max_seq_len=200, hidden_size=128, epochs=100, patience=10, seed=42
+# 训练配置：batch_size=128, max_seq_len=200, hidden_size=128, epochs=50, patience=8, seed=42
+# 2026-06-09: 改为20%分层采样数据，batch=128/epoch=50加速实验
 from __future__ import annotations
 
 import argparse
@@ -30,10 +31,10 @@ from model import SRDKT
 CONFIG = {
     "hidden_size": 128,
     "num_layers": 1,
-    "batch_size": 64,
+    "batch_size": 128,
     "lr": 0.001,
-    "epochs": 100,
-    "patience": 10,  # early stopping patience
+    "epochs": 50,
+    "patience": 8,  # early stopping patience
     "seed": 42,
     "max_seq_len": 200,
     "lambda_constraint_weight": 0.01,  # lambda约束损失权重
