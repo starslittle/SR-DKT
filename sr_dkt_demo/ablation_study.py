@@ -295,8 +295,14 @@ def main() -> None:
         name: {"AUC": m["AUC"], "ACC": m["ACC"], "F1": m["F1"]}
         for name, m in results.items()
     }
-    RESULT_PATH.write_text(json.dumps(save_results, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"\n[ablation] 已保存结果: {RESULT_PATH}")
+    if args.dataset == "mooc":
+        result_path = DATA_DIR / "mooc" / "ablation_results_mooc.json"
+    elif args.dataset == "2017":
+        result_path = DATA_DIR / "2017" / "ablation_results_2017.json"
+    else:
+        result_path = DATA_DIR / "2009" / "ablation_results.json"
+    result_path.write_text(json.dumps(save_results, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"\n[ablation] 已保存结果: {result_path}")
 
     # 打印对比表格
     print_results(results, dataset=args.dataset)

@@ -1,13 +1,18 @@
-# 功能：训练并评估 SR-DKT 的 6 组消融变体，验证各组件贡献。
+# 功能：训练并评估 SR-DKT 的 7 组消融/公平性变体，验证各组件贡献。
 # 作者：SR-DKT 项目组
 # 日期：2026-05-11
 # 消融配置：
 #   1. Full SR-DKT    - 完整模型：双路径LSTM + 差异化遗忘 + 注意力融合
 #   2. w/o Storage    - 去掉lstm_s，只用lstm_r，S固定为0.5
-#   3. w/o Retrieval  - 去掉lstm_r，只用lstm_s，R固定为0.5
-#   4. Shared LSTM    - lstm_s和lstm_r合并为一个共享LSTM
-#   5. Uniform Decay  - lambda_s = lambda_r（去掉差异化）
-#   6. Mean Fusion    - 注意力融合改为简单平均 alpha_s=alpha_r=0.5
+#   3. w/o Retrieval  - 去掉lstm_r，只用lstm_s，R置零
+#   4. Uniform Decay  - lambda_s = lambda_r（去掉差异化）
+#   5. Mean Fusion    - 注意力融合改为简单平均 alpha_s=alpha_r=0.5
+#   6. Single Path    - 单路径退化，只保留Storage路径
+#   7. w/o Video      - 去掉 watch_ratio / is_replay，验证视频特征贡献
+#
+# 注意：历史版本在多个消融类中使用 one-hot KC 输入，MOOCCubeX 的
+# num_kc 可达 30001，会造成显存/内存风险。主流程现在统一复用
+# model.py 中基于 Embedding 的 SRDKT(ablation_mode=...) 实现。
 from __future__ import annotations
 
 import argparse
@@ -52,6 +57,11 @@ LOG_PATH = DATA_DIR / "training_logs.json"
 FIG_PATH = ROOT_DIR / "results" / "ablation_bar.png"
 
 
+def safe_file_stem(name: str) -> str:
+    """将实验名转成适合文件名的短标识。"""
+    return "".join(ch if ch.isalnum() else "_" for ch in name).strip("_").lower()
+
+
 def get_dataset_dir(dataset: str) -> Path:
     """根据数据集名称返回对应的子目录"""
     if dataset == "mooc":
@@ -80,13 +90,72 @@ def collate_recent_batch(batch):
     return collate_batch(batch, CONFIG["max_seq_len"])
 
 
+class SRDKTAblationWrapper(nn.Module):
+    """Embedding 版 SR-DKT 消融包装器，避免大规模 KC one-hot 展开。"""
+
+    _CONSTRAINT_MODES = {"full", "no_attention", "no_storage", "no_video"}
+
+    def __init__(self, num_kc: int, hidden_size: int, ablation_mode: str) -> None:
+        super().__init__()
+        self.ablation_mode = ablation_mode
+        self.model = SRDKT(num_kc, hidden_size)
+
+    def forward(
+        self,
+        sequences: torch.Tensor,
+        delta_t_seq: torch.Tensor,
+        hints_seq: torch.Tensor,
+        attempts_seq: torch.Tensor,
+        watch_ratio_seq: torch.Tensor | None = None,
+        is_replay_seq: torch.Tensor | None = None,
+        mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        forward_mode = "full" if self.ablation_mode == "no_video" else self.ablation_mode
+        if self.ablation_mode == "no_video":
+            watch_ratio_seq = torch.zeros_like(delta_t_seq)
+            is_replay_seq = torch.zeros_like(delta_t_seq)
+
+        return self.model(
+            sequences,
+            delta_t_seq,
+            hints_seq,
+            attempts_seq,
+            watch_ratio_seq=watch_ratio_seq,
+            is_replay_seq=is_replay_seq,
+            mask=mask,
+            ablation_mode=forward_mode,
+        )
+
+    def get_lambda_constraint_loss(self) -> torch.Tensor:
+        if self.ablation_mode not in self._CONSTRAINT_MODES:
+            return torch.zeros((), device=next(self.parameters()).device)
+        return self.model.get_lambda_constraint_loss()
+
+
 def save_training_log(model_name: str, auc_history: list[float]) -> None:
     """保存训练日志"""
+    history = [float(v) for v in auc_history]
+
+    # 并行单变体实验时，独立日志文件不会互相覆盖。
+    log_dir = LOG_PATH.parent / "training_logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    single_log_path = log_dir / f"{safe_file_stem(model_name)}.json"
+    single_log_path.write_text(
+        json.dumps({model_name: history}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    # 聚合日志保留给顺序训练和前端读取；并行时以独立日志为准。
     logs = {}
     if LOG_PATH.exists():
-        logs = json.loads(LOG_PATH.read_text(encoding="utf-8"))
-    logs[model_name] = [float(v) for v in auc_history]
-    LOG_PATH.write_text(json.dumps(logs, ensure_ascii=False, indent=2), encoding="utf-8")
+        try:
+            logs = json.loads(LOG_PATH.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            logs = {}
+    logs[model_name] = history
+    tmp_path = LOG_PATH.with_name(f"{LOG_PATH.stem}_{safe_file_stem(model_name)}.tmp")
+    tmp_path.write_text(json.dumps(logs, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp_path.replace(LOG_PATH)
 
 
 # =============================================================================
@@ -909,6 +978,20 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="SR-DKT Ablation Study")
     parser.add_argument("--dataset", default="2009", choices=["2009", "2017", "mooc"],
                         help="选择数据集")
+    parser.add_argument(
+        "--variant",
+        default=None,
+        choices=[
+            "full",
+            "no_storage",
+            "no_retrieval",
+            "shared_decay",
+            "no_attention",
+            "single_path",
+            "no_video",
+        ],
+        help="指定单个消融变体（不指定则跑全部 7 组）",
+    )
     args = parser.parse_args()
 
     set_seed(CONFIG["seed"])
@@ -958,37 +1041,54 @@ def main() -> None:
         collate_fn=collate_recent_batch,
     )
 
-    # 定义 6 组消融配置
+    # 定义 7 组消融 / 公平性配置。
+    # 全部使用 model.py 中的 Embedding 版 ablation_mode，避免 MOOCCubeX
+    # 大知识点词表下 legacy one-hot 消融类造成 OOM。
     variants = {
-        "Full SR-DKT": (
-            SRDKT(num_kc, CONFIG["hidden_size"]),
+        "full": (
+            "Full SR-DKT",
+            SRDKTAblationWrapper(num_kc, CONFIG["hidden_size"], "full"),
             "完整模型：双路径LSTM + 差异化遗忘 + 注意力融合"
         ),
-        "w/o Storage": (
-            SRDKTWithoutStorage(num_kc, CONFIG["hidden_size"]),
+        "no_storage": (
+            "w/o Storage",
+            SRDKTAblationWrapper(num_kc, CONFIG["hidden_size"], "no_storage"),
             "去掉lstm_s，只用lstm_r，S固定为0.5"
         ),
-        "w/o Retrieval": (
-            SRDKTWithoutRetrieval(num_kc, CONFIG["hidden_size"]),
-            "去掉lstm_r，只用lstm_s，R固定为0.5"
+        "no_retrieval": (
+            "w/o Retrieval",
+            SRDKTAblationWrapper(num_kc, CONFIG["hidden_size"], "no_retrieval"),
+            "去掉lstm_r，只用lstm_s，R置零"
         ),
-        "Shared LSTM": (
-            SRDKTSharedLSTM(num_kc, CONFIG["hidden_size"]),
-            "lstm_s和lstm_r合并为一个共享LSTM"
-        ),
-        "Uniform Decay": (
-            SRDKTUniformDecay(num_kc, CONFIG["hidden_size"]),
+        "shared_decay": (
+            "Uniform Decay",
+            SRDKTAblationWrapper(num_kc, CONFIG["hidden_size"], "shared_decay"),
             "lambda_s = lambda_r（去掉差异化遗忘）"
         ),
-        "Mean Fusion": (
-            SRDKTMeanFusion(num_kc, CONFIG["hidden_size"]),
+        "no_attention": (
+            "Mean Fusion",
+            SRDKTAblationWrapper(num_kc, CONFIG["hidden_size"], "no_attention"),
             "注意力融合改为简单平均 alpha_s=alpha_r=0.5"
+        ),
+        "single_path": (
+            "Single Path",
+            SRDKTAblationWrapper(num_kc, CONFIG["hidden_size"], "single_path"),
+            "单路径退化，只保留Storage路径"
+        ),
+        "no_video": (
+            "w/o Video Features",
+            SRDKTAblationWrapper(num_kc, CONFIG["hidden_size"], "no_video"),
+            "去掉 watch_ratio / is_replay，验证视频特征贡献"
         ),
     }
 
+    if args.variant:
+        variants = {args.variant: variants[args.variant]}
+        print(f"[ablation] 单变体模式: {args.variant}")
+
     # 训练所有变体
     results = {}
-    for name, (model, note) in variants.items():
+    for _variant_key, (name, model, note) in variants.items():
         print(f"\n{'='*50}")
         print(f"训练消融变体: {name}")
         print(f"说明: {note}")
@@ -998,14 +1098,34 @@ def main() -> None:
         )
 
     # 保存结果
-    RESULT_PATH.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"\n[ablation] 已保存结果: {RESULT_PATH}")
+    if args.dataset == "mooc":
+        result_path = ds_dir / "ablation_results_mooc.json"
+        fig_path = ROOT_DIR / "results" / "ablation_bar_mooc.png"
+    elif args.dataset == "2017":
+        result_path = ds_dir / "ablation_results_2017.json"
+        fig_path = ROOT_DIR / "results" / "ablation_bar_2017.png"
+    else:
+        result_path = ds_dir / "ablation_results.json"
+        fig_path = FIG_PATH
+    if args.variant:
+        single_result_path = result_path.with_name(
+            f"{result_path.stem}_{safe_file_stem(args.variant)}.json"
+        )
+        single_result_path.write_text(
+            json.dumps(results, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        print(f"\n[ablation] 已保存单变体结果: {single_result_path}")
+    else:
+        result_path.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"\n[ablation] 已保存结果: {result_path}")
 
     # 打印对比表格
     print_results(results)
 
-    # 生成柱状图
-    plot_ablation_bar(results, FIG_PATH)
+    # 全量消融才生成柱状图；单变体并行跑时最终汇总后再画图。
+    if not args.variant:
+        plot_ablation_bar(results, fig_path)
 
 
 if __name__ == "__main__":

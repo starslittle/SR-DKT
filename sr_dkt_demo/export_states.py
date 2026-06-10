@@ -118,9 +118,16 @@ def main() -> None:
     else:
         eval_name = "eval_results.pkl"
     eval_path = ds_dir / eval_name
-    auc, acc = evaluate_model(model, loader, device)
+    metrics = evaluate_model(model, loader, device)
     with eval_path.open("wb") as f:
-        pickle.dump({"AUC": float(auc), "ACC": float(acc)}, f)
+        pickle.dump(
+            {
+                "AUC": float(metrics["AUC"]),
+                "ACC": float(metrics["ACC"]),
+                "F1": float(metrics["F1"]),
+            },
+            f,
+        )
 
     print(f"[export_states] 已导出学生状态: {state_path}")
     print(f"[export_states] 已保存模型评估: {eval_path}")

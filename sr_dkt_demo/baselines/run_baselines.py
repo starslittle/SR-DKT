@@ -60,6 +60,11 @@ CKPT_DIR = DATA_DIR / "ckpt"
 LOG_PATH = DATA_DIR / "training_logs.json"
 
 
+def safe_file_stem(name: str) -> str:
+    """将模型名转成适合文件名的短标识。"""
+    return "".join(ch if ch.isalnum() else "_" for ch in name).strip("_").lower()
+
+
 def get_dataset_dir(dataset: str) -> Path:
     """根据数据集名称返回对应的子目录"""
     if dataset == "mooc":
@@ -90,11 +95,28 @@ def collate_recent_batch(batch):
 
 def save_training_log(model_name: str, auc_history: list[float]) -> None:
     """保存训练日志"""
+    history = [float(v) for v in auc_history]
+
+    # 并行单模型实验时，独立日志文件不会互相覆盖。
+    log_dir = LOG_PATH.parent / "training_logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    single_log_path = log_dir / f"{safe_file_stem(model_name)}.json"
+    single_log_path.write_text(
+        json.dumps({model_name: history}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    # 聚合日志保留给顺序训练和前端读取；并行时以独立日志为准。
     logs = {}
     if LOG_PATH.exists():
-        logs = json.loads(LOG_PATH.read_text(encoding="utf-8"))
-    logs[model_name] = [float(v) for v in auc_history]
-    LOG_PATH.write_text(json.dumps(logs, ensure_ascii=False, indent=2), encoding="utf-8")
+        try:
+            logs = json.loads(LOG_PATH.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            logs = {}
+    logs[model_name] = history
+    tmp_path = LOG_PATH.with_name(f"{LOG_PATH.stem}_{safe_file_stem(model_name)}.tmp")
+    tmp_path.write_text(json.dumps(logs, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp_path.replace(LOG_PATH)
 
 
 def forward_model(model: nn.Module, model_name: str, batch: dict) -> torch.Tensor:
@@ -429,13 +451,19 @@ def main() -> None:
             name, model, train_loader, val_loader, test_loader, device
         )
 
-    # 保存结果（合并已有结果，支持并行跑时共享 result_path）
-    if result_path.exists():
-        existing = json.loads(result_path.read_text(encoding="utf-8"))
-        existing.update(results)
-        results = existing
-    result_path.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"\n[baselines] 已保存结果: {result_path}")
+    # 保存结果。单模型模式写独立文件，避免并行进程抢写同一个 JSON。
+    if args.model:
+        single_result_path = result_path.with_name(
+            f"{result_path.stem}_{safe_file_stem(args.model)}.json"
+        )
+        single_result_path.write_text(
+            json.dumps(results, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        print(f"\n[baselines] 已保存单模型结果: {single_result_path}")
+    else:
+        result_path.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"\n[baselines] 已保存结果: {result_path}")
 
     # 打印对比表格
     print_results(results, dataset=args.dataset)
