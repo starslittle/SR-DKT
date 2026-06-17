@@ -55,27 +55,32 @@ SR-DKT 采用**双路径 LSTM** 架构：
 └─────────────────────────────────────────────────────────────┘
 ```
 
-核心公式：
+核心公式（2026-06 架构修订后）：
 
 ```text
-# 差异化遗忘
+# 差异化遗忘：λ_s、λ_r 为两个【独立】可学习参数（softplus 保正）
 λ_s = softplus(log_lambda_s)        # Storage 遗忘速率（慢）
-λ_r = λ_s + softplus(log_lambda_r)  # Retrieval 遗忘速率（快，硬约束 λ_r > λ_s）
+λ_r = softplus(log_lambda_r)        # Retrieval 遗忘速率（快），独立学习，不再写死 = λ_s+…
 
-# 时间衰减
-S_t = S_raw × exp(-λ_s × Δt_norm)
-R_t = R_raw × exp(-λ_r × Δt_norm)
+# 时间衰减：直接作用于【进入预测的隐状态】h_s / h_r（而非仅作用于标量强度）
+h_s_decay = h_s × exp(-λ_s × Δt_norm)
+h_r_decay = h_r × exp(-λ_r × Δt_norm)
 
-# 注意力融合
+# 可解释双状态强度（从衰减后隐状态导出，用于门控与可视化）
+S_t = sigmoid(fc_S(h_s_decay));  R_t = sigmoid(fc_R(h_r_decay))
+
+# 注意力融合：门控由 [S_t, R_t] 生成，加权【衰减后的隐状态】
 α = softmax(W × [S_t, R_t])
-h_fused = α_s × h_s + α_r × h_r
+h_fused = α_s × h_s_decay + α_r × h_r_decay
 
 # 预测
 P(correct) = sigmoid(fc_pred(h_fused))
 
-# 约束损失
+# 软约束损失：鼓励（而非强制）λ_r > λ_s；λ 独立后此项才有真实梯度
 constraint_loss = relu(λ_s - λ_r + margin)
 ```
+
+> **架构修订说明**：早期版本把遗忘衰减只施加在标量 `S_t/R_t` 上、且 `λ_r = λ_s + softplus(·)` 写死，导致 λ 对预测几乎无作用、约束损失恒为 0。现已改为：衰减直接作用于隐状态 `h_s/h_r`，且 λ_s、λ_r 独立可学习 + 软约束。修订后旧 checkpoint 失效，SR-DKT 需重新训练。
 
 Harness Agent 只推荐 `S < 0.5` 或 `R < 0.4` 的薄弱知识点，并按优先级得分取 Top-K。
 
@@ -286,6 +291,48 @@ CUDA_VISIBLE_DEVICES=0 python wandb_train.py --dataset_name=moocx --model_name=d
 
 如果当前 pyKT 版本的 DKT-Forget 模型名使用连字符或其他别名，以该版本 `configs/kt_config.json` 和 `pykt/models` 中的实际模型名为准。
 
+## 降本与跨框架对齐工作流（10% 子集 + pyKT）
+
+为在有限算力下完成多组对比，并保证 SR-DKT 与 pyKT 基线**可比、不被质疑**，采用以下工作流。
+
+### 一、切 10% 分层训练子集（只采样 train，val/test 全量）
+
+```bash
+python subsample_mooc.py --src-dir data/mooc --out-dir data/mooc_10pct --ratio 0.1 --seed 42
+```
+
+- 按序列长度分位数分 10 层，逐层等比例采样，分布与全量一致；固定种子可复现。
+- val/test/meta/encoder 通过硬链接复用全量文件（零额外占盘）。
+- 额外产出 `data/mooc_10pct/subset_train_user_ids.json`，供下一步对齐 pyKT。
+
+### 二、把 pyKT 训练 fold 过滤到同一批 10% 学生
+
+```bash
+python filter_pykt_to_subset.py \
+    --ids data/mooc_10pct/subset_train_user_ids.json \
+    --pykt-dir data/mooc_pykt/pykt_ready \
+    --out-dir  data/mooc_pykt_10pct/pykt_ready
+```
+
+- 仅过滤 pyKT 的 fold 0（训练）到这 10% 学生；fold 1（验证）与 test 保持全量，与 SR-DKT 评估集一致。
+- 自动重写 `data_config` 的 `dpath`。pyKT 训练时把 `dataset_name=moocx` 指向该目录。
+
+### 三、双框架对齐验证（消除“跨框架混淆”质疑的关键）
+
+标准基线在官方 pyKT 框架跑、SR-DKT 在自研框架跑，二者可比性需验证。`baseline_models.py`
+提供了 **pyKT 同款标准 DKT（`DKT-Vec`，向量输出 + gather 下一题）** 作为对齐锚点：
+
+```bash
+# 自研框架跑 pyKT 同款 DKT（10% 数据）
+python baselines/run_baselines.py --dataset mooc --model DKT-Vec
+
+# 官方 pyKT 跑 DKT（同一 10% 数据 data/mooc_pykt_10pct）
+# 详见下方 pyKT 命令模板
+```
+
+若两者 AUC 差 `< ~0.005`，即证明“自研框架 ≈ pyKT 框架”，SR-DKT 便可与 pyKT 基线表同列比较。
+注意：本仓库另有一个**标量输出**的 `DKT`（不知道下一题），仅作历史/调试用，不可与 pyKT 数字对比。
+
 ## MOOCCubeX 实验推荐顺序
 
 正式论文实验建议按以下顺序跑：
@@ -332,8 +379,10 @@ CUDA_VISIBLE_DEVICES=2 python ablation/ablation_study.py --dataset mooc --varian
 可单跑的 baseline 名称：
 
 ```text
-DKT, DKT-F, SAKT, AKT, LBKT, DKVMN, BEKT, SR-DKT
+DKT, DKT-Vec, DKT-F, SAKT, AKT, LBKT, DKVMN, BEKT, SR-DKT
 ```
+
+> `DKT-Vec` 为 pyKT 同款标准 DKT（跨框架对齐锚点）；`DKT` 为标量输出旧版，仅作历史/调试用。
 
 可单跑的消融变体：
 
@@ -398,13 +447,15 @@ data/training_logs/w_o_video_features.json
 
 | 参数 | 值 | 说明 |
 |------|------|------|
-| `batch_size` | 64 | 批次大小 |
-| `max_seq_len` | 200 | 最大序列长度 |
+| `batch_size` | 128 | 批次大小 |
+| `max_seq_len` | 200 | 最大序列长度；与官方 pyKT 数据对齐，便于跨框架验证 |
 | `hidden_size` | 128 | LSTM 隐层维度 |
-| `epochs` | 100 | 最大训练轮数 |
-| `patience` | 10 | Early stopping 耐心值 |
+| `epochs` | 50 | 最大训练轮数 |
+| `patience` | 8 | Early stopping 耐心值 |
 | `seed` | 42 | 随机种子 |
-| `lambda_constraint_weight` | 0.01 | λ 约束损失权重 |
+| `lambda_constraint_weight` | 0.01 | λ 软约束损失权重（λ_s、λ_r 独立可学习） |
+
+> MOOCCubeX 大规模实验采用 **10% 分层训练子集 + 全量验证/测试集** 降本，见下节工作流。
 
 各模型独立学习率：
 
@@ -501,9 +552,11 @@ SR-DKT 消融 / 公平性实验包含 7 组配置，验证各组件贡献：
 | `harness_agent.py` | 根据 S/R 状态生成结构化学习推荐 |
 | `evaluate.py` | 输出模型层 AUC/ACC/F1 与推荐层 WCG、HR@10、NDCG@10 |
 | `demo.py` | 命令行展示单个学生的知识状态、推荐和评估指标 |
-| `baselines/baseline_models.py` | 基线模型定义：DKT, DKT-F, SAKT, AKT, DKVMN, LBKT, BEKT |
+| `baselines/baseline_models.py` | 基线模型定义：DKT（标量，旧）, DKTVec（pyKT 同款，跨框架锚点）, DKT-F, SAKT, AKT, DKVMN, LBKT, BEKT |
 | `baselines/run_baselines.py` | 批量训练基线模型，独立学习率配置，打印对比表格 |
 | `ablation/ablation_study.py` | SR-DKT 消融 / 公平性实验（7 组配置），生成对比表格和柱状图 |
+| `subsample_mooc.py` | 从全量训练集分层切 10% 子集（只采样 train），产出学生 ID 列表 |
+| `filter_pykt_to_subset.py` | 把 pyKT 训练 fold 过滤到同一 10% 学生，对齐两框架的训练集 |
 
 ## 消融模式说明
 

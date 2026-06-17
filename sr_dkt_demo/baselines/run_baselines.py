@@ -1,8 +1,11 @@
 # 功能：统一训练并评估 DKT、DKT-F、SAKT、AKT、LBKT 与 SR-DKT，对比 AUC/ACC/F1。
 # 已修复 Bug 3：ROOT_DIR 路径错误、import 文件名错误、forward_model 中 mask 参数位置错误
+# 已修复 Bug 4：SAKT num_layers 默认为 2，应与 pyKT 对齐为 1
 # 作者：SR-DKT 项目组
 # 日期：2026-05-11
-# 训练配置：batch_size=64, max_seq_len=200, hidden_size=128, epochs=100, patience=10, seed=42
+# 训练配置：batch_size=128, max_seq_len=200, hidden_size=128, epochs=50, patience=8, seed=42
+# 注意：max_seq_len 与官方 pyKT 数据(maxlen=200)保持一致，便于自研框架与 pyKT 交叉验证；
+#       降本主要靠 10% 训练子集(见 subsample_mooc.py)，不再靠缩短序列。
 # 学习率配置：DKT/DKT-F/LBKT/SR-DKT lr=0.001, SAKT lr=5e-4, AKT lr=1e-4
 from __future__ import annotations
 
@@ -27,7 +30,7 @@ PARENT_DIR = ROOT_DIR.parent
 if str(PARENT_DIR) not in sys.path:
     sys.path.insert(0, str(PARENT_DIR))
 
-from baseline_models import AKT, BEKT, DKT, DKT_F, DKVMN, LBKT, SAKT
+from baseline_models import AKT, BEKT, DKT, DKT_F, DKTVec, DKVMN, LBKT, SAKT
 from model import SRDKT
 from train import SequenceDataset, collate_batch, move_batch
 
@@ -39,13 +42,14 @@ CONFIG = {
     "epochs": 50,
     "patience": 8,
     "seed": 42,
-    "max_seq_len": 200,
+    "max_seq_len": 200,  # 与官方 pyKT 数据(maxlen=200)对齐；降本靠 10% 子集而非缩短序列
     "lambda_constraint_weight": 0.01,
 }
 
 # 模型独立学习率配置
 MODEL_LR = {
     "DKT": 0.001,
+    "DKT-Vec": 0.001,  # pyKT 同款标准 DKT，跨框架对齐锚点
     "DKT-F": 0.001,
     "SAKT": 5e-4,   # SAKT 需要较小学习率
     "AKT": 1e-4,    # AKT 需要最小学习率
@@ -370,8 +374,10 @@ def main() -> None:
     parser.add_argument("--dataset", default="2009", choices=["2009", "2017", "mooc"],
                         help="选择数据集: 2009, 2017 或 mooc")
     parser.add_argument("--model", default=None,
-                        choices=["DKT", "DKT-F", "SAKT", "AKT", "LBKT", "DKVMN", "BEKT", "SR-DKT"],
-                        help="指定单个模型名（不指定则跑全部 8 个）")
+                        choices=["DKT", "DKT-Vec", "DKT-F", "SAKT", "AKT", "LBKT", "DKVMN", "BEKT", "SR-DKT"],
+                        help="指定单个模型名（不指定则跑全部）")
+    parser.add_argument("--data-dir", dest="data_dir", default=None,
+                        help="直接指定数据目录，覆盖默认路径（例如 data/mooc_10pct 跑 10%% 子集）")
     args = parser.parse_args()
 
     set_seed(CONFIG["seed"])
@@ -380,8 +386,10 @@ def main() -> None:
     dataset_label = {"2009": "ASSISTments 2009", "2017": "ASSISTments 2017", "mooc": "MOOCCubeX"}.get(args.dataset, args.dataset)
     print(f"[baselines] 数据集: {dataset_label}")
 
-    # 加载数据
-    ds_dir = get_dataset_dir(args.dataset)
+    # 加载数据（--data-dir 优先，便于指向 10% 子集目录）
+    ds_dir = Path(args.data_dir) if args.data_dir else get_dataset_dir(args.dataset)
+    if args.data_dir:
+        print(f"[baselines] 数据目录(覆盖): {ds_dir}")
     if args.dataset == "2017":
         train_data = load_pickle(ds_dir / "train_2017.pkl")
         val_data = load_pickle(ds_dir / "val_2017.pkl")
@@ -427,8 +435,9 @@ def main() -> None:
     # 创建所有模型（使用独立学习率）
     model_configs = {
         "DKT":    DKT(num_kc, CONFIG["hidden_size"]),
+        "DKT-Vec": DKTVec(num_kc, CONFIG["hidden_size"]),  # pyKT 同款，跨框架对齐锚点
         "DKT-F":  DKT_F(num_kc, CONFIG["hidden_size"]),
-        "SAKT":   SAKT(num_kc, CONFIG["hidden_size"]),
+        "SAKT":   SAKT(num_kc, CONFIG["hidden_size"], num_layers=1),  # 与 pyKT 对齐，默认2层会偏强
         "AKT":    AKT(num_kc, CONFIG["hidden_size"]),
         "LBKT":   LBKT(num_kc, CONFIG["hidden_size"]),
         "DKVMN":  DKVMN(num_kc, CONFIG["hidden_size"]),

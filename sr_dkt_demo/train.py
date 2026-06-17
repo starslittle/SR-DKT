@@ -364,6 +364,8 @@ def main() -> None:
                         help="选择数据集: 2009, 2017 或 mooc")
     parser.add_argument("--lambda_weight", type=float, default=0.01,
                         help="lambda约束损失权重")
+    parser.add_argument("--data-dir", dest="data_dir", default=None,
+                        help="直接指定数据目录，覆盖默认路径（例如 data/mooc_10pct 跑 10%% 子集）")
     args = parser.parse_args()
 
     set_seed(CONFIG["seed"])
@@ -372,8 +374,10 @@ def main() -> None:
     dataset_label = "MOOCCubeX" if args.dataset == "mooc" else f"ASSISTments {args.dataset}"
     print(f"[train] 数据集: {dataset_label}")
 
-    # 加载数据
-    ds_dir = get_dataset_dir(args.dataset)
+    # 加载数据（--data-dir 优先，便于指向 10% 子集目录）
+    ds_dir = Path(args.data_dir) if args.data_dir else get_dataset_dir(args.dataset)
+    if args.data_dir:
+        print(f"[train] 数据目录(覆盖): {ds_dir}")
     if args.dataset == "2017":
         train_data = load_pickle(ds_dir / "train_2017.pkl")
         val_data = load_pickle(ds_dir / "val_2017.pkl")

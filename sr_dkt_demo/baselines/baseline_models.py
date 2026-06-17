@@ -42,10 +42,55 @@ class DKT(nn.Module):
         return logits, hidden
 
 
+class DKTVec(nn.Module):
+    """pyKT 同款标准 DKT —— 跨框架对齐锚点。
+
+    与本文件中的标量 `DKT` 不同，本类严格对齐 Piech 2015 / 官方 pyKT 的 DKT：
+      - 交互嵌入 interaction_emb(c + vocab * r)
+      - 单层 LSTM
+      - 输出层 Linear(hidden, vocab)，对【全部知识点】输出概率向量
+      - 预测第 t+1 步时，在【下一题对应的知识点】处 gather，即条件于下一题身份
+
+    用途：在自研框架内用本模型在 10% 子集上训练，其 AUC 应与官方 pyKT 的 DKT
+    在同一 10% 数据上的 AUC 接近（差值 < ~0.005）。一旦接近，即证明"自研训练/
+    评估框架 ≈ pyKT 框架"，从而消除"SR-DKT 与 pyKT 基线跨框架不可比"的质疑。
+
+    返回 (B, T, 1) 的下一步预测概率，可直接接入现有 sequence_loss / evaluate
+    的默认 next-step 对齐（preds[:, :-1] vs corrects[:, 1:]）。
+
+    显存提示：输出张量为 (B, T, vocab)，MOOCCubeX 下 vocab≈30002，B=128/T=200
+    时约占 3GB；若 OOM 可调小 batch_size。
+    """
+
+    def __init__(self, num_kc: int, hidden_size: int = 128, dropout: float = 0.1) -> None:
+        super().__init__()
+        self.num_kc = num_kc
+        self.vocab = num_kc + 1  # +1 容纳 OTHER/OOD 类，与本框架其余模型一致
+        self.interaction_emb = nn.Embedding(self.vocab * 2, hidden_size)
+        self.lstm = nn.LSTM(hidden_size, hidden_size, batch_first=True)
+        self.dropout = nn.Dropout(dropout)
+        self.out_layer = nn.Linear(hidden_size, self.vocab)
+
+    def forward(self, kc_ids: torch.Tensor, corrects: torch.Tensor,
+                mask: torch.Tensor | None = None):
+        c = kc_ids.long().clamp(min=0, max=self.num_kc)
+        r = corrects.long().clamp(min=0, max=1)
+        x = c + self.vocab * r                       # 交互 id = 概念 + vocab*正误
+        xemb = self.interaction_emb(x)               # (B, T, H)
+        hidden, _ = self.lstm(xemb)
+        hidden = self.dropout(hidden)
+        y = torch.sigmoid(self.out_layer(hidden))    # (B, T, vocab) 全概念概率
+
+        # 在【下一题对应概念】处 gather：pred[t] = y[t, c_{t+1}]
+        c_next = torch.cat([c[:, 1:], c[:, -1:]], dim=1)        # (B, T)，末位占位(被损失丢弃)
+        pred = torch.gather(y, 2, c_next.unsqueeze(-1))         # (B, T, 1)
+        return pred, hidden
+
+
 class DKT_F(nn.Module):
     """DKT with Forgetting, extending DKT with time-decayed hidden states.
-    
-    NOTE: Use Embedding instead of one-hot encoding to support 
+
+    NOTE: Use Embedding instead of one-hot encoding to support
     large KC vocabulary (e.g. MOOCCubeX with 30,000+ KCs).
     """
 

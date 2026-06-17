@@ -58,11 +58,14 @@ def parse_datetime_to_epoch(s: str) -> float:
         return float("nan")
 
 
-def parse_problem_id(problem_id: str | None) -> int | None:
-    if not problem_id:
+def parse_problem_id(problem_id: str | int | None) -> int | None:
+    if problem_id is None or problem_id == "":
         return None
     try:
-        return int(problem_id[3:]) if problem_id.startswith("Pm_") else int(problem_id)
+        s = str(problem_id)
+        if s.startswith("Pm_"):
+            return int(s[3:])
+        return int(s)
     except ValueError:
         return None
 
@@ -120,7 +123,10 @@ def load_problem_to_exercise(mooc_dir: Path) -> dict[int, str]:
                     obj = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                pid = parse_problem_id(obj.get("id") or obj.get("problem_id"))
+                pid_raw = obj.get("id")
+                if pid_raw is None:
+                    pid_raw = obj.get("problem_id")
+                pid = parse_problem_id(pid_raw)
                 exercise_id = obj.get("exercise_id")
                 if pid is not None and exercise_id and pid not in p2e:
                     p2e[pid] = str(exercise_id)

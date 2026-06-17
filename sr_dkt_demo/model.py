@@ -18,8 +18,11 @@ class SRDKT(nn.Module):
     - lstm_s: 处理主动检索行为（做题、论坛发帖、测验）
     - lstm_r: 处理被动接收行为（看视频、浏览材料）
 
-    差异化遗忘：lambda_r > lambda_s（可学习参数，软约束）
-    双状态融合：注意力加权 alpha_s * S_t + alpha_r * R_t
+    差异化遗忘：lambda_s、lambda_r 为两个独立可学习参数，由软约束损失
+                 鼓励 lambda_r > lambda_s（短期提取衰减更快）。遗忘衰减
+                 直接作用在进入预测的隐状态 h_s / h_r 上，因此 lambda
+                 真正影响最终预测，而非仅调节融合权重。
+    双状态融合：注意力加权 alpha_s * h_s + alpha_r * h_r（衰减后）
     """
 
     def __init__(self, num_kc: int, hidden_size: int = 128, num_layers: int = 1) -> None:
@@ -57,10 +60,12 @@ class SRDKT(nn.Module):
         # Retrieval Head -> R_t (before decay)
         self.fc_R = nn.Linear(hidden_size, 1)
 
-        # 差异化遗忘速率（可学习，初始化保证 lambda_r > lambda_s）
-        # 使用 softplus 保证正值
-        self.log_lambda_s = nn.Parameter(torch.tensor(-2.0))  # ~0.13
-        self.log_lambda_r = nn.Parameter(torch.tensor(-1.0))  # ~0.37，初始 > lambda_s
+        # 差异化遗忘速率：两个【独立】可学习参数，softplus 保证正值。
+        # 初始化让 lambda_r > lambda_s，但二者各自自由学习；是否保持
+        # lambda_r > lambda_s 由软约束损失鼓励（get_lambda_constraint_loss），
+        # 而非写死的恒等式 —— 这样该不等式是「学出来的」，可写入论文。
+        self.log_lambda_s = nn.Parameter(torch.tensor(-2.0))  # softplus ~0.13
+        self.log_lambda_r = nn.Parameter(torch.tensor(-1.0))  # softplus ~0.31，初始 > lambda_s
 
         # 注意力融合层：输入 [S_t, R_t] -> 权重 [alpha_s, alpha_r]
         self.fusion_attn = nn.Linear(2, 2)
@@ -75,10 +80,8 @@ class SRDKT(nn.Module):
 
     @property
     def lambda_r(self) -> torch.Tensor:
-        """Retrieval遗忘速率，保证 > lambda_s"""
-        # lambda_r = lambda_s + softplus(delta)，确保 lambda_r > lambda_s
-        delta = F.softplus(self.log_lambda_r)
-        return self.lambda_s + delta
+        """Retrieval遗忘速率，独立可学习（不再写死 > lambda_s）"""
+        return F.softplus(self.log_lambda_r)
 
     def encode_storage_inputs(
         self,
@@ -179,15 +182,12 @@ class SRDKT(nn.Module):
         if is_replay_seq is None:
             is_replay_seq = torch.zeros(B, T, device=device)
 
-        # ---- Storage 分支 ----
+        # ---- Storage 分支（主动行为：做题/测验）----
         if ablation_mode == 'no_storage':
-            # 去掉 Storage，S 固定为 0.5
-            s_seq = torch.full((B, T, 1), 0.5, device=device)
             h_s = torch.zeros(B, T, self.hidden_size, device=device)
         else:
             x_s = self.encode_storage_inputs(sequences, delta_t_seq, hints_seq, attempts_seq)
-
-            # 如果有 mask，用 pack_padded_sequence 避免 padding 污染 LSTM 隐状态
+            # 用 pack_padded_sequence 避免 padding 污染 LSTM 隐状态
             if mask is not None:
                 lengths = mask.sum(dim=1).clamp(min=1).long().cpu()
                 x_s_packed = pack_padded_sequence(x_s, lengths, batch_first=True, enforce_sorted=False)
@@ -196,21 +196,11 @@ class SRDKT(nn.Module):
             else:
                 h_s, _ = self.lstm_s(x_s)
 
-            s_seq = torch.sigmoid(self.fc_S(h_s))  # (B, T, 1)
-
-        # ---- 单路径退化：等价于DKT-F，只用Storage路径 ----
-        if ablation_mode == 'single_path':
-            p_seq = torch.sigmoid(self.fc_pred(h_s))
-            return p_seq, s_seq, torch.zeros_like(s_seq)
-
-        # ---- Retrieval 分支 ----
-        if ablation_mode == 'no_retrieval':
-            r_seq = torch.zeros(B, T, 1, device=device)
+        # ---- Retrieval 分支（被动行为：看视频/浏览）----
+        if ablation_mode in ('no_retrieval', 'single_path'):
             h_r = torch.zeros(B, T, self.hidden_size, device=device)
         else:
             x_r = self.encode_retrieval_inputs(sequences, delta_t_seq, watch_ratio_seq, is_replay_seq)
-
-            # 同样对 Retrieval LSTM 使用 pack_padded_sequence
             if mask is not None:
                 lengths_r = mask.sum(dim=1).clamp(min=1).long().cpu()
                 x_r_packed = pack_padded_sequence(x_r, lengths_r, batch_first=True, enforce_sorted=False)
@@ -219,9 +209,8 @@ class SRDKT(nn.Module):
             else:
                 h_r, _ = self.lstm_r(x_r)
 
-            r_raw = torch.sigmoid(self.fc_R(h_r))  # (B, T, 1)
-
-        # ---- 差异化遗忘衰减 ----
+        # ---- 差异化遗忘：直接衰减【进入预测的隐状态】 ----
+        # delta_t_norm[t] = 归一化的「到下一次交互的时间间隔」（预测时已知，非泄漏）
         if delta_t_seq.dim() == 2:
             delta_t_seq = delta_t_seq.unsqueeze(-1)
         last_delta = torch.zeros(B, 1, 1, device=device, dtype=delta_t_seq.dtype)
@@ -229,36 +218,48 @@ class SRDKT(nn.Module):
         delta_t_norm = (torch.log1p(delta_t_next.clamp(min=0)) /
                         torch.log1p(torch.tensor(30.0, device=device)))
 
-        # Storage衰减（慢）
-        s_seq = self.apply_decay(s_seq, delta_t_norm, self.lambda_s)
+        # Storage 衰减慢（lambda_s），Retrieval 衰减快（lambda_r）。
+        # 衰减系数 (B,T,1) 广播到隐状态 (B,T,H)：lambda 由此真正影响预测。
+        if ablation_mode != 'no_storage':
+            h_s = self.apply_decay(h_s, delta_t_norm, self.lambda_s)
+        if ablation_mode not in ('no_retrieval', 'single_path'):
+            # shared_decay 消融：Retrieval 也用 lambda_s，去掉差异化遗忘
+            lambda_r_used = self.lambda_s if ablation_mode == 'shared_decay' else self.lambda_r
+            h_r = self.apply_decay(h_r, delta_t_norm, lambda_r_used)
 
-        # Retrieval衰减：shared_decay模式下使用lambda_s替代lambda_r
-        if ablation_mode == 'no_retrieval':
+        # ---- 可解释的双状态强度（从衰减后的隐状态导出，用于可视化/解释）----
+        if ablation_mode == 'no_storage':
+            s_seq = torch.full((B, T, 1), 0.5, device=device)
+        else:
+            s_seq = torch.sigmoid(self.fc_S(h_s))  # (B, T, 1)
+        if ablation_mode in ('no_retrieval', 'single_path'):
             r_seq = torch.zeros(B, T, 1, device=device)
         else:
-            lambda_r_used = self.lambda_s if ablation_mode == 'shared_decay' else self.lambda_r
-            r_seq = self.apply_decay(r_raw, delta_t_norm, lambda_r_used)
+            r_seq = torch.sigmoid(self.fc_R(h_r))  # (B, T, 1)
 
-        # ---- 融合层 ----
+        # ---- 单路径退化：等价 DKT-Forget，只用衰减后的 Storage ----
+        if ablation_mode == 'single_path':
+            p_seq = torch.sigmoid(self.fc_pred(h_s))
+            return p_seq, s_seq, r_seq
+
+        # ---- 融合层（对【衰减后】的隐状态融合）----
         if ablation_mode == 'no_attention':
             # 简单平均融合
-            h_fused_raw = 0.5 * h_s + 0.5 * h_r
+            h_fused = 0.5 * h_s + 0.5 * h_r
         elif ablation_mode == 'no_storage':
-            # 只用 Retrieval
-            h_fused_raw = h_r
+            h_fused = h_r
         elif ablation_mode == 'no_retrieval':
-            # 只用Storage
-            h_fused_raw = h_s
+            h_fused = h_s
         else:
-            # 注意力融合
+            # 注意力融合：门控由衰减后的双状态强度生成
             sr_cat = torch.cat([s_seq, r_seq], dim=-1)  # (B, T, 2)
             alpha = torch.softmax(self.fusion_attn(sr_cat), dim=-1)  # (B, T, 2)
             alpha_s = alpha[..., 0:1]
             alpha_r = alpha[..., 1:2]
-            h_fused_raw = alpha_s * h_s + alpha_r * h_r
+            h_fused = alpha_s * h_s + alpha_r * h_r
 
         # ---- 最终预测 ----
-        p_seq = torch.sigmoid(self.fc_pred(h_fused_raw))  # (B, T, 1)
+        p_seq = torch.sigmoid(self.fc_pred(h_fused))  # (B, T, 1)
 
         return p_seq, s_seq, r_seq
 
