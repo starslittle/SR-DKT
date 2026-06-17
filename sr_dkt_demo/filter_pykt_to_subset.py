@@ -78,8 +78,10 @@ def load_subset_uids(ids_path: Path, id_maps_path: Path) -> set[str]:
 def filter_train_valid(src: Path, dst: Path, subset_uids: set[str]) -> None:
     """fold==0(train)只保留子集学生;fold==1(val)全部保留。"""
     dst.parent.mkdir(parents=True, exist_ok=True)
-    kept_train = kept_val = dropped_train = 0
-    with src.open("r", encoding="utf-8", newline="") as fin, \
+    kept_train = kept_val = dropped_train = bad_rows = 0
+    # errors="replace": 容忍源文件中极少数非 UTF-8 字节,不让整个读取崩溃;
+    # 含替换符(�)的行视为坏行直接跳过,避免把垃圾写进 pyKT 输入。
+    with src.open("r", encoding="utf-8", errors="replace", newline="") as fin, \
          dst.open("w", encoding="utf-8", newline="") as fout:
         reader = csv.reader(fin)
         writer = csv.writer(fout)
@@ -91,6 +93,9 @@ def filter_train_valid(src: Path, dst: Path, subset_uids: set[str]) -> None:
         except ValueError:
             fold_i, uid_i = 0, 1  # 兜底:前两列即 fold,uid
         for row in reader:
+            if any("�" in cell for cell in row):
+                bad_rows += 1
+                continue
             fold = row[fold_i]
             uid = row[uid_i]
             if fold == "0":
@@ -105,7 +110,7 @@ def filter_train_valid(src: Path, dst: Path, subset_uids: set[str]) -> None:
                 kept_val += 1
     print(
         f"[filter] train_valid: 训练序列保留 {kept_train:,} / 丢弃 {dropped_train:,}，"
-        f"验证序列全量保留 {kept_val:,}"
+        f"验证序列全量保留 {kept_val:,}，跳过坏行 {bad_rows:,}"
     )
 
 

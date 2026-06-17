@@ -38,7 +38,6 @@ data/_archive/
 *.csv
 SR-DKT*.md
 export_train_table.py
-AutoDL实验流程.md
 references/
 
 # ── 保留 ASSISTments 数据（小文件，已跟踪，用于快速验证） ──
