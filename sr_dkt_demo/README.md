@@ -278,6 +278,8 @@ DKT, DKVMN, SAKT, AKT, simpleKT, DKT-Forget, SR-DKT
 
 pyKT 第一批 baseline 命令模板如下。不同 pyKT 版本可能提供 `wandb_{model}_train.py` 包装脚本；若使用通用入口，可在 pyKT 的 `examples/` 目录下按以下形式运行：
 
+> ⚠️ `pip install pykt-toolkit` 只安装 `pykt` 库，**不含 `examples/wandb_train.py` 与 `configs/data_config.json`**。要跑下面的命令需另外取源码：`git clone https://github.com/pykt-team/pykt-toolkit.git`，再 `cd pykt-toolkit/examples`。
+
 ```bash
 cd /path/to/pykt-toolkit/examples
 
@@ -333,7 +335,22 @@ python baselines/run_baselines.py --dataset mooc --model DKT-Vec
 若两者 AUC 差 `< ~0.005`，即证明“自研框架 ≈ pyKT 框架”，SR-DKT 便可与 pyKT 基线表同列比较。
 注意：本仓库另有一个**标量输出**的 `DKT`（不知道下一题），仅作历史/调试用，不可与 pyKT 数字对比。
 
+### 四、在 10% 子集上训练（各脚本如何指向子集数据）
+
+不同脚本读取数据的方式不一致，跑 10% 子集时务必区分：
+
+| 脚本 | 支持 `--data-dir` | 在 10% 子集上的跑法 |
+|------|:---:|------|
+| `train.py` | ✅ | `--data-dir data/mooc_10pct` |
+| `baselines/run_baselines.py` | ✅ | `--data-dir data/mooc_10pct` |
+| `ablation/ablation_study.py` | ❌ | 硬编码读 `data/mooc`；需先把 `data/mooc` 软链接指向子集，跑完还原 |
+| `evaluate.py` | ❌ | 同上（且按 `data/mooc/best_model_mooc.pt` 找模型） |
+
+> 完整云端命令（含消融/评估的软链接 `mv data/mooc … && ln -s` 与还原步骤）见 `AutoDL实验流程.md` 第五步。
+
 ## MOOCCubeX 实验推荐顺序
+
+> 本节是**概念顺序**。AutoDL 云端的完整可照抄操作步骤（路径/scp/screen/GPU/软链接等）见 `AutoDL实验流程.md`，命令以那份为准，避免两处重复。
 
 正式论文实验建议按以下顺序跑：
 
