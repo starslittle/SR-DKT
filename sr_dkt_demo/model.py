@@ -67,6 +67,13 @@ class SRDKT(nn.Module):
         self.log_lambda_s = nn.Parameter(torch.tensor(-2.0))  # softplus ~0.13
         self.log_lambda_r = nn.Parameter(torch.tensor(-1.0))  # softplus ~0.31，初始 > lambda_s
 
+        # 残差门控「保留底」β：经 sigmoid 限制在 (0,1)，各自可学习。
+        # 衰减系数 = β + (1-β)·exp(-λ·Δt) ∈ [β, 1]，即记忆保留一个持久核心 β，
+        # 只有「新鲜部分」(1-β) 随时间遗忘 —— 避免把隐状态整体压成 0 而破坏表征。
+        # 初始化 β_s 高(Storage 持久) > β_r 低(Retrieval 易挥发)，差异化遗忘的第二维度。
+        self.logit_beta_s = nn.Parameter(torch.tensor(1.5))   # sigmoid ~0.82
+        self.logit_beta_r = nn.Parameter(torch.tensor(0.0))   # sigmoid ~0.50
+
         # 注意力融合层：输入 [S_t, R_t] -> 权重 [alpha_s, alpha_r]
         self.fusion_attn = nn.Linear(2, 2)
 
@@ -82,6 +89,16 @@ class SRDKT(nn.Module):
     def lambda_r(self) -> torch.Tensor:
         """Retrieval遗忘速率，独立可学习（不再写死 > lambda_s）"""
         return F.softplus(self.log_lambda_r)
+
+    @property
+    def beta_s(self) -> torch.Tensor:
+        """Storage 保留底（持久核心比例），sigmoid 限制在 (0,1)"""
+        return torch.sigmoid(self.logit_beta_s)
+
+    @property
+    def beta_r(self) -> torch.Tensor:
+        """Retrieval 保留底，独立可学习，初始低于 beta_s"""
+        return torch.sigmoid(self.logit_beta_r)
 
     def encode_storage_inputs(
         self,
@@ -129,14 +146,22 @@ class SRDKT(nn.Module):
 
     def apply_decay(
         self,
-        state_seq: torch.Tensor,   # (B, T, 1) 原始状态
-        delta_t_seq: torch.Tensor, # (B, T, 1) 时间间隔
-        lambda_val: torch.Tensor,  # scalar
+        state_seq: torch.Tensor,   # (B, T, H) 隐状态
+        delta_t_seq: torch.Tensor, # (B, T, 1) 归一化时间间隔
+        lambda_val: torch.Tensor,  # scalar，遗忘速率
+        floor: torch.Tensor,       # scalar，保留底 β ∈ (0,1)
     ) -> torch.Tensor:
-        """对状态序列施加指数遗忘衰减"""
-        decay = torch.exp(-lambda_val * delta_t_seq.clamp(min=0))
-        decay = decay.clamp(min=0.01, max=1.0)
-        return state_seq * decay
+        """残差门控式遗忘衰减。
+
+        decay 系数 = β + (1-β)·exp(-λ·Δt)，取值 [β, 1]：
+        - 保留底 β 表示记忆的持久核心，永不被遗忘清零；
+        - 只有「新鲜部分」(1-β) 随时间按 exp(-λ·Δt) 衰减；
+        - λ 仍真实调节遗忘快慢（λ_r>λ_s → Retrieval 忘得快），但不再像旧版
+          纯乘法那样把整个隐状态压到 ~0、破坏预测表征。
+        """
+        raw = torch.exp(-lambda_val * delta_t_seq.clamp(min=0))  # (B,T,1) ∈ (0,1]
+        factor = floor + (1.0 - floor) * raw                     # ∈ [β, 1]
+        return state_seq * factor
 
     def forward(
         self,
@@ -218,14 +243,17 @@ class SRDKT(nn.Module):
         delta_t_norm = (torch.log1p(delta_t_next.clamp(min=0)) /
                         torch.log1p(torch.tensor(30.0, device=device)))
 
-        # Storage 衰减慢（lambda_s），Retrieval 衰减快（lambda_r）。
-        # 衰减系数 (B,T,1) 广播到隐状态 (B,T,H)：lambda 由此真正影响预测。
+        # 残差门控衰减：系数 β+(1-β)exp(-λΔt) (B,T,1) 广播到隐状态 (B,T,H)。
+        # Storage 慢忘+高保留(lambda_s, beta_s)，Retrieval 快忘+低保留(lambda_r, beta_r)。
         if ablation_mode != 'no_storage':
-            h_s = self.apply_decay(h_s, delta_t_norm, self.lambda_s)
+            h_s = self.apply_decay(h_s, delta_t_norm, self.lambda_s, self.beta_s)
         if ablation_mode not in ('no_retrieval', 'single_path'):
-            # shared_decay 消融：Retrieval 也用 lambda_s，去掉差异化遗忘
-            lambda_r_used = self.lambda_s if ablation_mode == 'shared_decay' else self.lambda_r
-            h_r = self.apply_decay(h_r, delta_t_norm, lambda_r_used)
+            # shared_decay 消融：Retrieval 也用 lambda_s/beta_s，去掉差异化遗忘
+            if ablation_mode == 'shared_decay':
+                lambda_r_used, beta_r_used = self.lambda_s, self.beta_s
+            else:
+                lambda_r_used, beta_r_used = self.lambda_r, self.beta_r
+            h_r = self.apply_decay(h_r, delta_t_norm, lambda_r_used, beta_r_used)
 
         # ---- 可解释的双状态强度（从衰减后的隐状态导出，用于可视化/解释）----
         if ablation_mode == 'no_storage':

@@ -336,7 +336,9 @@ def train_sr_dkt(
             f"Val AUC: {val_auc:.4f} | "
             f"Val ACC: {val_metrics['ACC']:.4f} | "
             f"λ_s: {model.lambda_s.item():.3f} | "
-            f"λ_r: {model.lambda_r.item():.3f}"
+            f"λ_r: {model.lambda_r.item():.3f} | "
+            f"β_s: {model.beta_s.item():.3f} | "
+            f"β_r: {model.beta_r.item():.3f}"
         )
 
         # Early stopping 监控验证集 AUC

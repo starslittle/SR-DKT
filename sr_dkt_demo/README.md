@@ -62,9 +62,12 @@ SR-DKT 采用**双路径 LSTM** 架构：
 λ_s = softplus(log_lambda_s)        # Storage 遗忘速率（慢）
 λ_r = softplus(log_lambda_r)        # Retrieval 遗忘速率（快），独立学习，不再写死 = λ_s+…
 
-# 时间衰减：直接作用于【进入预测的隐状态】h_s / h_r（而非仅作用于标量强度）
-h_s_decay = h_s × exp(-λ_s × Δt_norm)
-h_r_decay = h_r × exp(-λ_r × Δt_norm)
+# 残差门控遗忘：保留底 β（持久核心，永不清零）+ 只让「新鲜部分」(1-β) 随时间衰减。
+# 衰减系数 ∈ [β, 1]，直接作用于【进入预测的隐状态】h_s / h_r。
+h_s_decay = h_s × (β_s + (1-β_s) × exp(-λ_s × Δt_norm))
+h_r_decay = h_r × (β_r + (1-β_r) × exp(-λ_r × Δt_norm))
+# β_s（Storage 保留底，高）> β_r（Retrieval 保留底，低）：差异化遗忘的第二个维度。
+# 旧版纯乘法 h×exp(-λΔt) 会把隐状态整体压到 ~0、破坏预测表征，故改为残差门控。
 
 # 可解释双状态强度（从衰减后隐状态导出，用于门控与可视化）
 S_t = sigmoid(fc_S(h_s_decay));  R_t = sigmoid(fc_R(h_r_decay))
@@ -80,7 +83,7 @@ P(correct) = sigmoid(fc_pred(h_fused))
 constraint_loss = relu(λ_s - λ_r + margin)
 ```
 
-> **架构修订说明**：早期版本把遗忘衰减只施加在标量 `S_t/R_t` 上、且 `λ_r = λ_s + softplus(·)` 写死，导致 λ 对预测几乎无作用、约束损失恒为 0。现已改为：衰减直接作用于隐状态 `h_s/h_r`，且 λ_s、λ_r 独立可学习 + 软约束。修订后旧 checkpoint 失效，SR-DKT 需重新训练。
+> **架构修订说明**：早期版本把遗忘衰减只施加在标量 `S_t/R_t` 上、且 `λ_r = λ_s + softplus(·)` 写死，导致 λ 对预测几乎无作用、约束损失恒为 0。改为：衰减直接作用于隐状态 `h_s/h_r`，且 λ_s、λ_r 独立可学习 + 软约束。**二次修订（2026-06）**：纯乘法 `h×exp(-λΔt)` 会把隐状态整体压到 ~0、破坏预测表征导致 AUC 下降，故改为**残差门控** `h×(β+(1-β)exp(-λΔt))`，新增可学习保留底 β_s>β_r。每次架构修订后旧 checkpoint 失效，SR-DKT 需重新训练。
 
 Harness Agent 只推荐 `S < 0.5` 或 `R < 0.4` 的薄弱知识点，并按优先级得分取 Top-K。
 
