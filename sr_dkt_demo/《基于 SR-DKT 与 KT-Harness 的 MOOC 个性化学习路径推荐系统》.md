@@ -1082,7 +1082,30 @@ MALPP 已经包含 Reflection Agent，因此本文不再把“设置 Reflection 
 
 结论：MALPP 已覆盖“多 Agent + Reflection 路径规划”的一部分思路，因此本文的创新重心应放在 **学习动作推荐 + 反事实验证**，即用 SR-DKT 双状态向量动态驱动 Constrain、Verify 和 Correct，而不是单独强调 Reflection Agent。
 
-### 11.8 研究空白总结
+### 11.8 与 MemoryKT 等记忆过程类 KT 的差异（最近邻，必须澄清）
+
+相关研究：
+
+- **MemoryKT: An Integrative Memory-and-Forgetting Method for KT, arXiv 2508.08122, 2025.**
+- **CPF: Concept-driven Personalized Forgetting KT, arXiv 2404.12127, 2024.**
+- **GRKT: Graph-based Reasonable KT（教育学理论驱动）, arXiv 2406.12896, 2024.**
+- **FoLiBi: Forgetting-aware Linear Bias for Attentive KT, arXiv 2309.14796, 2023.**
+
+其中 **MemoryKT（2025）是与本文理论内核最接近的工作**：它同样以"存储/提取"和遗忘为核心，显式建模 encoding–storage–retrieval 三阶段记忆过程（用时序 VAE：编码器=encoding、LSTM=storage、解码器=retrieval），并设计**个性化遗忘模块**，从每个学生历史行为统计出"个性化遗忘分数"调节存储强度。因此"存储-提取 + 差异化遗忘"本身**已不再是独占的创新点**，本文必须明确与之划界。
+
+| # | 维度 | MemoryKT (2025) | 本文 SR-DKT | 本文是否独有 |
+|---|---|---|---|:---:|
+| 1 | "存储/提取"含义 | 记忆**过程阶段**（编码→存储→提取流水线，Atkinson-Shiffrin 式） | Bjork 双强度理论的两个**强度状态**（存储强度 vs 提取强度）**并行建模** | 理论谱系不同 |
+| 2 | 结构 | 单流 VAE + LSTM | **双路径**：Storage 走做题、Retrieval 走视频，参数不共享 | ✅ |
+| 3 | 遗忘差异化的"轴" | **跨学生**个性化（per-student 遗忘分） | **跨记忆类型**（`λ_R > λ_S`，提取比存储忘得快） | ✅ 不同轴 |
+| 4 | 数据 / 模态 | 纯做题数据集（ASSIST09/15 等） | **MOOC 多模态行为**（`watch_ratio` / `is_replay` 视频信号） | ✅ |
+| 5 | 应用 | 纯 KT 预测 | KT + **学习动作推荐与 KT-Harness 闭环** | ✅ |
+
+**诚实的短板（须在论文中正面处理）**：MemoryKT 的核心卖点是**跨学生个性化遗忘**，而本文 `λ_S`、`λ_R`、`β` 当前为**全局参数**（所有学生共用），在"个性化"这一维度弱于 MemoryKT。应对方式有二：（a）将本文创新口径明确钉在"**按学习行为类型分路 + 跨记忆类型差异化遗忘 + 推荐应用**"，主动声明个性化遗忘非本文主张；（b）后续为 `λ / β` 增加由学生历史统计驱动的轻量 per-student 调节，补齐个性化维度。
+
+**创新口径结论**：在 MemoryKT/CPF 之后，本文**不再以"提出存储-提取双状态遗忘"为头条创新**，而应表述为——"基于 Bjork 双强度理论，**首次将存储/提取强度与主动做题/被动观看两类学习行为分路绑定**，配合跨记忆类型差异化遗忘（`λ_R > λ_S`），并由双状态驱动 MOOC 学习动作推荐（KT-Harness）"。GRKT（理论驱动 + 可解释 + 赢基线）是本文叙事范本；FoLiBi 表明此类遗忘改进的现实增益约 +2.58% AUC，提示本文不应以"大幅领先准确率"为主要卖点，而以**可解释 + 行为分路 + 推荐应用**立论。
+
+### 11.9 研究空白总结
 
 | 已有研究 | 主要空白 | 本文机会 |
 |---|---|---|
@@ -1091,6 +1114,7 @@ MALPP 已经包含 Reflection Agent，因此本文不再把“设置 Reflection 
 | DDKT 等双通道 KT | 关注难度通道，不关注 MOOC 行为类型 | SR-DKT 双状态追踪 |
 | BEKT 等行为增强 KT | 行为作为特征补丁，缺少结构级路径与遗忘 | SR-DKT 结构级双状态与差异化遗忘 |
 | DKT-F / LFKT 等遗忘 KT | 多集中在习题场景 | MOOC 主动 / 被动行为差异化遗忘 |
+| MemoryKT / CPF 等记忆-遗忘 KT（2024-2025） | 记忆过程/个性化遗忘，单流、纯做题、无推荐 | 行为分路（做题/视频）+ 跨记忆类型遗忘 + 推荐应用 |
 | MALPP 等多 Agent 路径规划 | 有 Reflection，但缺少知识追踪和 Harness 动态约束 | KT-Harness 教育驾驭系统 |
 | 软件工程 Harness | 有 Constrain / Verify / Correct，但约束多为代码规则 | 用 SR-DKT 双状态生成教育场景动态约束 |
 | 静态学习路径推荐 | 缺少基于掌握度变化的反馈优化 | KT-Harness 迭代收敛闭环 |
