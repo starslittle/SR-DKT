@@ -281,7 +281,10 @@ mkdir -p logs   # 否则下方 tee logs/xxx.log 会报错
 # ① 从全量分层切 10% 训练子集（val/test 全量复用）
 python subsample_mooc.py --src-dir data/mooc --out-dir data/mooc_10pct --ratio 0.1 --seed 42
 
-# ② 把 pyKT 训练 fold 过滤到同一批 10% 学生，并清洗非法 sequence token
+# ② 如 pyKT sequence 是旧产物，先按时间正序重新导出 pyKT ready 数据
+python export_mooc_pykt_sequences.py 2>&1 | tee logs/export_mooc_pykt_sequences.log
+
+# ③ 把 pyKT 训练 fold 过滤到同一批 10% 学生，并清洗非法 sequence token
 python filter_pykt_to_subset.py \
   --ids data/mooc_10pct/subset_train_user_ids.json \
   --pykt-dir data/mooc_pykt/pykt_ready \
@@ -317,6 +320,7 @@ python baselines/run_baselines.py --dataset mooc --data-dir data/mooc_10pct --mo
 ```bash
 cd /path/to/pykt-toolkit/examples
 # 将 data/mooc_pykt_10pct/pykt_ready/data_config_moocx.json 合并进 pyKT configs/data_config.json
+# 跑之前确认 data/mooc_pykt_10pct/pykt_ready 的 timestamps 无倒序。
 for m in dkt dkvmn sakt akt simplekt dkt_forget; do
   CUDA_VISIBLE_DEVICES=0 python wandb_train.py --dataset_name=moocx --model_name=$m --emb_type=qid --fold=1 --use_wandb=0 --add_uuid=0
 done

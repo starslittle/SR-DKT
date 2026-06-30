@@ -226,7 +226,7 @@ python export_mooc_pykt_sequences.py
 - 读取同一份原始 `user-problem.json`。
 - 优先读取已有 `data/mooc/train.pkl`、`val.pkl`、`test.pkl` 的用户划分，使 pyKT baseline 和 SR-DKT 使用相同 train / val / test 学生。
 - 如果没有 SR-DKT split，可以显式使用 hash split。
-- `export_mooc_pykt_sequences.py` 使用 fold 0 表示 train，fold 1 表示 val，fold -1 表示 test；`timestamp` 和 `duration` 会转换为 pyKT loader 需要的毫秒单位。
+- `export_mooc_pykt_sequences.py` 使用 fold 0 表示 train，fold 1 表示 val，fold -1 表示 test；`timestamp` 和 `duration` 会转换为 pyKT loader 需要的毫秒单位。每个学生在每个 fold 内按 `timestamp_ms` 主排序、`order_id` 辅助打破同时间戳并列，保证 KT 序列是时间正序。
 
 ```bash
 python preprocess_mooc_pykt.py --split-source hash
@@ -322,6 +322,7 @@ python filter_pykt_to_subset.py \
 - 仅过滤 pyKT 的 fold 0（训练）到这 10% 学生；fold 1（验证）与 test 保持全量，与 SR-DKT 评估集一致。
 - 同时严格校验/清洗 `questions/concepts/responses/timestamps/usetimes/selectmasks` 的整数 token；默认将非法 token 替换为 `-1`，并写出 `filter_clean_report.json`。
 - 自动重写 `data_config` 的 `dpath`。pyKT 训练时把 `dataset_name=moocx` 指向该目录。
+- 若 `data/mooc_pykt/pykt_ready` 是旧导出产物，先重新运行 `python export_mooc_pykt_sequences.py`，再执行本过滤脚本；旧版 sequence 可能按原始文件顺序而非时间顺序切窗。
 
 ### 三、双框架对齐验证（消除“跨框架混淆”质疑的关键）
 

@@ -185,13 +185,17 @@ def write_sequences(
         test_writer.writeheader()
 
         for uid, events in events_by_uid.items():
-            events.sort(key=lambda event: (event[0], event[1], event[5]))
-
             by_fold: dict[int, list[tuple[int, int, int, int, int, int, int]]] = defaultdict(list)
             for event in events:
                 by_fold[event[0]].append(event)
 
-            for fold, fold_events in by_fold.items():
+            for fold in (0, 1, -1):
+                fold_events = by_fold.get(fold)
+                if not fold_events:
+                    continue
+                # KT sequence order must be chronological. order_id is only a
+                # stable tie-breaker when two submissions have the same timestamp.
+                fold_events.sort(key=lambda event: (event[5], event[1]))
                 for start in range(0, len(fold_events), maxlen):
                     chunk = fold_events[start : start + maxlen]
                     if len(chunk) < min_seq_len:
@@ -266,6 +270,7 @@ def write_metadata(
             "Copy or merge data_config_moocx.json into pyKT configs/data_config.json.",
             "Run pyKT with dataset_name=moocx and fold=1 so fold 0 is train and fold 1 is validation.",
             "DKT-Forget requires timestamps; this exporter writes timestamps in milliseconds.",
+            "Within each user and fold, events are sorted by timestamp_ms then order_id before windowing.",
         ],
     }
     (output_dir / "meta_sequences.json").write_text(
