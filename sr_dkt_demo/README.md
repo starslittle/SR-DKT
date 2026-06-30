@@ -188,11 +188,11 @@ python preprocess_mooc.py --max-kc 30000 --min-interactions 3
 # 2. 训练 SR-DKT
 python train.py --dataset mooc
 
-# 3. 评估 SR-DKT
-python evaluate.py --dataset mooc
-
-# 4. 导出学生 S/R 状态，供推荐层使用
+# 3. 导出学生 S/R 状态，供推荐层评估使用
 python export_states.py --dataset mooc
+
+# 4. 评估 SR-DKT
+python evaluate.py --dataset mooc
 
 # 5. 启动前端查看结果
 streamlit run app.py
@@ -320,6 +320,7 @@ python filter_pykt_to_subset.py \
 ```
 
 - 仅过滤 pyKT 的 fold 0（训练）到这 10% 学生；fold 1（验证）与 test 保持全量，与 SR-DKT 评估集一致。
+- 同时严格校验/清洗 `questions/concepts/responses/timestamps/usetimes/selectmasks` 的整数 token；默认将非法 token 替换为 `-1`，并写出 `filter_clean_report.json`。
 - 自动重写 `data_config` 的 `dpath`。pyKT 训练时把 `dataset_name=moocx` 指向该目录。
 
 ### 三、双框架对齐验证（消除“跨框架混淆”质疑的关键）
@@ -568,7 +569,7 @@ SR-DKT 消融 / 公平性实验包含 7 组配置，验证各组件贡献：
 | `preprocess_mooc.py` | MOOCCubeX -> SR-DKT 7 元组训练数据，融合 `watch_ratio` / `is_replay` |
 | `preprocess_mooc_pykt.py` | MOOCCubeX -> pyKT 标准交互 CSV，保留 `question_id` / `concept_id` / `timestamp` / `duration` |
 | `export_mooc_pykt_sequences.py` | pyKT 交互 CSV -> pyKT sequence CSV，并生成 `data_config_moocx.json` |
-| `export_states.py` | 导出测试学生各知识点最新 S/R 状态到 `student_states.pkl` |
+| `export_states.py` | 导出测试学生各知识点最新 S/R 状态到 `student_states*.pkl` |
 | `harness_agent.py` | 根据 S/R 状态生成结构化学习推荐 |
 | `evaluate.py` | 输出模型层 AUC/ACC/F1 与推荐层 WCG、HR@10、NDCG@10 |
 | `demo.py` | 命令行展示单个学生的知识状态、推荐和评估指标 |
@@ -576,7 +577,7 @@ SR-DKT 消融 / 公平性实验包含 7 组配置，验证各组件贡献：
 | `baselines/run_baselines.py` | 批量训练基线模型，独立学习率配置，打印对比表格 |
 | `ablation/ablation_study.py` | SR-DKT 消融 / 公平性实验（7 组配置），生成对比表格和柱状图 |
 | `subsample_mooc.py` | 从全量训练集分层切 10% 子集（只采样 train），产出学生 ID 列表 |
-| `filter_pykt_to_subset.py` | 把 pyKT 训练 fold 过滤到同一 10% 学生，对齐两框架的训练集 |
+| `filter_pykt_to_subset.py` | 把 pyKT 训练 fold 过滤到同一 10% 学生，并严格清洗/校验 pyKT sequence CSV |
 
 ## 消融模式说明
 

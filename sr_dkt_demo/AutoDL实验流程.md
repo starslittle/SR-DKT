@@ -281,7 +281,7 @@ mkdir -p logs   # 否则下方 tee logs/xxx.log 会报错
 # ① 从全量分层切 10% 训练子集（val/test 全量复用）
 python subsample_mooc.py --src-dir data/mooc --out-dir data/mooc_10pct --ratio 0.1 --seed 42
 
-# ② 把 pyKT 训练 fold 过滤到同一批 10% 学生
+# ② 把 pyKT 训练 fold 过滤到同一批 10% 学生，并清洗非法 sequence token
 python filter_pykt_to_subset.py \
   --ids data/mooc_10pct/subset_train_user_ids.json \
   --pykt-dir data/mooc_pykt/pykt_ready \
@@ -364,6 +364,7 @@ rm data/mooc && mv data/mooc_full data/mooc
 
 ```bash
 mv data/mooc data/mooc_full && ln -s mooc_10pct data/mooc   # 若 5.5 已做可跳过
+python export_states.py --dataset mooc 2>&1 | tee logs/export_states.log
 python evaluate.py --dataset mooc 2>&1 | tee logs/evaluate.log
 rm data/mooc && mv data/mooc_full data/mooc
 ```
@@ -440,6 +441,7 @@ mkdir -p logs
 python subsample_mooc.py --src-dir data/mooc --out-dir data/mooc_10pct --ratio 0.1 --seed 42
 python filter_pykt_to_subset.py --ids data/mooc_10pct/subset_train_user_ids.json \
   --pykt-dir data/mooc_pykt/pykt_ready --out-dir data/mooc_pykt_10pct/pykt_ready
+# 若日志显示替换 token > 0，查看 data/mooc_pykt_10pct/pykt_ready/filter_clean_report.json
 
 # 5. 依次执行（train/run_baselines 用 --data-dir 指向 10% 子集）
 time python train.py --dataset mooc --data-dir data/mooc_10pct --lambda_weight 0.01 2>&1 | tee logs/train.log
@@ -449,6 +451,7 @@ time python baselines/run_baselines.py --dataset mooc --data-dir data/mooc_10pct
 # 消融/评估不支持 --data-dir：先把 data/mooc 指向子集，跑完还原（见 5.5/5.6）
 mv data/mooc data/mooc_full && ln -s mooc_10pct data/mooc
 time python ablation/ablation_study.py --dataset mooc 2>&1 | tee logs/ablation.log
+time python export_states.py --dataset mooc 2>&1 | tee logs/export_states.log
 time python evaluate.py --dataset mooc 2>&1 | tee logs/evaluate.log
 rm data/mooc && mv data/mooc_full data/mooc
 # 标准基线 DKT/DKVMN/SAKT/AKT/simpleKT/DKT-Forget 在官方 pyKT 跑（见 5.3）

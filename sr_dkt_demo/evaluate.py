@@ -29,6 +29,15 @@ def get_dataset_dir(dataset: str) -> Path:
     return DATA_DIR / ("2017" if dataset == "2017" else "2009")
 
 
+def get_state_name(dataset: str) -> str:
+    """返回 export_states.py 产出的学生状态文件名。"""
+    if dataset == "mooc":
+        return "student_states_mooc.pkl"
+    if dataset == "2017":
+        return "student_states_2017.pkl"
+    return "student_states.pkl"
+
+
 def load_pickle(path: Path):
     with path.open("rb") as f:
         return pickle.load(f)
@@ -102,9 +111,15 @@ def kc_midpoint_gain(seq: list[tuple], kc_id: int) -> float | None:
 def evaluate_harness(dataset: str = "2009") -> tuple[float, float, float]:
     ds_dir = get_dataset_dir(dataset)
     test_name = "test_2017.pkl" if dataset == "2017" else "test.pkl"
-    states_name = "student_states_2017.pkl" if dataset == "2017" else "student_states.pkl"
+    states_name = get_state_name(dataset)
+    states_path = ds_dir / states_name
+    if not states_path.exists():
+        raise FileNotFoundError(
+            f"缺少学生状态文件 {states_path}；请先运行 "
+            f"`python export_states.py --dataset {dataset}`。"
+        )
     test_data = load_pickle(ds_dir / test_name)
-    student_states = load_pickle(ds_dir / states_name)
+    student_states = load_pickle(states_path)
     agent = HarnessAgent(student_states)
 
     gains = []
