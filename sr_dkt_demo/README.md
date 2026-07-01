@@ -233,13 +233,19 @@ python preprocess_mooc_pykt.py --split-source hash
 python export_mooc_pykt_sequences.py
 ```
 
+两个脚本都支持实时日志，长任务建议使用：
+
+```bash
+python -u preprocess_mooc_pykt.py --split-source hash 2>&1 | tee logs/preprocess_mooc_pykt.log
+python -u export_mooc_pykt_sequences.py 2>&1 | tee logs/export_mooc_pykt_sequences.log
+```
+
 输出：
 
 ```text
 data/mooc_pykt/train.csv
 data/mooc_pykt/val.csv
 data/mooc_pykt/test.csv
-data/mooc_pykt/interactions.csv
 data/mooc_pykt/meta_pykt.json
 data/mooc_pykt/pykt_ready/train_valid_sequences.csv
 data/mooc_pykt/pykt_ready/test_sequences.csv
@@ -248,6 +254,8 @@ data/mooc_pykt/pykt_ready/data_config_moocx.json
 data/mooc_pykt/pykt_ready/id_maps.json
 data/mooc_pykt/pykt_ready/meta_sequences.json
 ```
+
+`interactions.csv` 默认不再输出；如确实需要全量交互合集，运行 `preprocess_mooc_pykt.py --write-interactions`。
 
 逐行交互 CSV 字段：
 

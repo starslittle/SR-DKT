@@ -26,6 +26,7 @@ import argparse
 import csv
 import json
 import shutil
+import time
 from collections import defaultdict
 from pathlib import Path
 from typing import Iterable
@@ -215,6 +216,193 @@ def write_sequences(
     return counts
 
 
+def write_event_chunks(
+    writer: csv.DictWriter,
+    fold: int,
+    uid: str,
+    events: list[tuple[int, int, int, int, int, int, int]],
+    maxlen: int,
+    min_seq_len: int,
+) -> tuple[int, int]:
+    """Sort one user's events and write fixed-length pyKT sequence rows."""
+    if not events:
+        return 0, 0
+    events.sort(key=lambda event: (event[5], event[1]))
+    written = 0
+    skipped = 0
+    for start in range(0, len(events), maxlen):
+        chunk = events[start : start + maxlen]
+        if len(chunk) < min_seq_len:
+            skipped += 1
+            continue
+        write_sequence_row(writer, fold, uid, chunk, maxlen)
+        written += 1
+    return written, skipped
+
+
+def process_split_stream(
+    split_name: str,
+    path: Path,
+    fold: int,
+    writer: csv.DictWriter,
+    output_count_key: str,
+    q_map: dict[str, int],
+    c_map: dict[str, int],
+    uid_map: dict[str, int],
+    sequence_counts: dict[str, int],
+    maxlen: int,
+    min_seq_len: int,
+    progress_rows: int,
+    max_rows: int | None,
+) -> tuple[int, int]:
+    """Stream one interaction CSV and flush sequences per contiguous user block."""
+    current_user_id: str | None = None
+    current_uid = ""
+    events: list[tuple[int, int, int, int, int, int, int]] = []
+    closed_users: set[str] = set()
+    reopened_users = 0
+    split_count = 0
+    skipped_rows = 0
+    t0 = time.time()
+
+    def flush_current() -> None:
+        nonlocal events
+        if current_user_id is None:
+            return
+        written, skipped = write_event_chunks(
+            writer, fold, current_uid, events, maxlen, min_seq_len
+        )
+        sequence_counts[output_count_key] += written
+        sequence_counts["skipped_short_sequences"] += skipped
+        events = []
+
+    with path.open("r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        for raw_idx, row in enumerate(reader, start=1):
+            if max_rows is not None and raw_idx > max_rows:
+                break
+            if progress_rows > 0 and raw_idx % progress_rows == 0:
+                elapsed = max(time.time() - t0, 1e-6)
+                print(
+                    "[pykt-seq] {} {:,} rows ({:,.0f}/s), sequences {:,}".format(
+                        split_name,
+                        raw_idx,
+                        raw_idx / elapsed,
+                        sequence_counts[output_count_key],
+                    ),
+                    flush=True,
+                )
+
+            user_id = row.get("user_id", "")
+            question_id = row.get("question_id", "")
+            concept_id = row.get("concept_id", "")
+            if not user_id or not question_id or not concept_id:
+                skipped_rows += 1
+                continue
+
+            if current_user_id is None:
+                current_user_id = user_id
+                current_uid = str(get_or_add(uid_map, user_id))
+            elif user_id != current_user_id:
+                flush_current()
+                closed_users.add(current_user_id)
+                if user_id in closed_users:
+                    reopened_users += 1
+                current_user_id = user_id
+                current_uid = str(get_or_add(uid_map, user_id))
+
+            qid = get_or_add(q_map, question_id)
+            cid = get_or_add(c_map, concept_id)
+            response = 1 if parse_int(row.get("response", "0")) else 0
+            order_id = parse_int(row.get("order_id", "0"))
+            timestamp_ms = parse_int(row.get("timestamp", "0")) * 1000
+            duration_ms = parse_duration_ms(row.get("duration", ""))
+            events.append((fold, order_id, qid, cid, response, timestamp_ms, duration_ms))
+            split_count += 1
+
+    flush_current()
+    elapsed = max(time.time() - t0, 1e-6)
+    print(
+        "[pykt-seq] {} done: {:,} rows, {:,} sequences, skipped_rows {:,}, reopened_users {}, {:.1f}s".format(
+            split_name,
+            split_count,
+            sequence_counts[output_count_key],
+            skipped_rows,
+            reopened_users,
+            elapsed,
+        ),
+        flush=True,
+    )
+    return split_count, reopened_users
+
+
+def write_sequences_streaming(
+    input_dir: Path,
+    output_dir: Path,
+    maxlen: int,
+    min_seq_len: int,
+    max_rows_per_split: int | None,
+    progress_rows: int,
+) -> tuple[dict[str, int], dict[str, int], dict[str, int], dict[str, int]]:
+    split_files = {
+        "train": (0, input_dir / "train.csv"),
+        "val": (1, input_dir / "val.csv"),
+        "test": (-1, input_dir / "test.csv"),
+    }
+    missing = [str(path) for _, path in split_files.values() if not path.exists()]
+    if missing:
+        raise FileNotFoundError("Missing pyKT interaction CSVs: " + ", ".join(missing))
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    q_map: dict[str, int] = {}
+    c_map: dict[str, int] = {}
+    uid_map: dict[str, int] = {}
+    split_counts = {"train": 0, "val": 0, "test": 0}
+    sequence_counts = {
+        "train_valid_sequences": 0,
+        "test_sequences": 0,
+        "skipped_short_sequences": 0,
+        "reopened_users": 0,
+    }
+
+    train_valid_path = output_dir / "train_valid_sequences.csv"
+    test_path = output_dir / "test_sequences.csv"
+    with train_valid_path.open("w", encoding="utf-8", newline="") as f_train, test_path.open(
+        "w", encoding="utf-8", newline=""
+    ) as f_test:
+        train_writer = csv.DictWriter(f_train, fieldnames=FIELDNAMES)
+        test_writer = csv.DictWriter(f_test, fieldnames=FIELDNAMES)
+        train_writer.writeheader()
+        test_writer.writeheader()
+
+        for split_name in ("train", "val", "test"):
+            fold, path = split_files[split_name]
+            writer = test_writer if split_name == "test" else train_writer
+            output_count_key = (
+                "test_sequences" if split_name == "test" else "train_valid_sequences"
+            )
+            count, reopened = process_split_stream(
+                split_name,
+                path,
+                fold,
+                writer,
+                output_count_key,
+                q_map,
+                c_map,
+                uid_map,
+                sequence_counts,
+                maxlen,
+                min_seq_len,
+                progress_rows,
+                max_rows_per_split,
+            )
+            split_counts[split_name] = count
+            sequence_counts["reopened_users"] += reopened
+
+    shutil.copyfile(test_path, output_dir / "test_window_sequences.csv")
+    return q_map, c_map, uid_map, split_counts, sequence_counts
+
+
 def write_metadata(
     output_dir: Path,
     q_map: dict[str, int],
@@ -291,16 +479,21 @@ def main() -> None:
         default=None,
         help="Debug/smoke-test limit. Omit for full export.",
     )
+    parser.add_argument(
+        "--progress-rows",
+        type=int,
+        default=5_000_000,
+        help="Print progress every N input rows per split.",
+    )
     args = parser.parse_args()
 
-    events_by_uid, q_map, c_map, uid_map, split_counts = load_events(
-        args.input_dir, args.max_rows_per_split
-    )
-    sequence_counts = write_sequences(
-        events_by_uid,
+    q_map, c_map, uid_map, split_counts, sequence_counts = write_sequences_streaming(
+        args.input_dir,
         args.output_dir,
         args.maxlen,
         args.min_seq_len,
+        args.max_rows_per_split,
+        args.progress_rows,
     )
     write_metadata(
         args.output_dir,

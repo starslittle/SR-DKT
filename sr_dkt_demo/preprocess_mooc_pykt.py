@@ -11,7 +11,8 @@ Default output:
   data/mooc_pykt/train.csv
   data/mooc_pykt/val.csv
   data/mooc_pykt/test.csv
-  data/mooc_pykt/interactions.csv
+Optional output:
+  data/mooc_pykt/interactions.csv  (--write-interactions)
   data/mooc_pykt/meta_pykt.json
 
 CSV fields:
@@ -93,7 +94,11 @@ def extract_duration_seconds(obj: dict) -> str:
     return ""
 
 
-def load_problem_to_exercise(mooc_dir: Path) -> dict[int, str]:
+def load_problem_to_exercise(
+    mooc_dir: Path,
+    use_problem_json_fallback: bool,
+    needed_problem_ids: set[int] | None = None,
+) -> dict[int, str]:
     """Load problem_id(int) -> exercise_id(str)."""
     relations_dir = mooc_dir / "relations"
     entities_dir = mooc_dir / "entities"
@@ -101,8 +106,19 @@ def load_problem_to_exercise(mooc_dir: Path) -> dict[int, str]:
 
     txt_path = relations_dir / "exercise-problem.txt"
     if txt_path.exists():
+        seen = 0
+        t0 = time.time()
         with open(txt_path, "rb") as f:
             for raw_line in f:
+                seen += 1
+                if seen % 1_000_000 == 0:
+                    elapsed = max(time.time() - t0, 1e-6)
+                    print(
+                        "[pykt-preprocess] exercise-problem {:,} lines ({:,.0f}/s), mappings {:,}".format(
+                            seen, seen / elapsed, len(p2e)
+                        ),
+                        flush=True,
+                    )
                 line = raw_line.strip()
                 if not line:
                     continue
@@ -112,13 +128,36 @@ def load_problem_to_exercise(mooc_dir: Path) -> dict[int, str]:
                 ex_id = line[:sep].decode("utf-8", errors="ignore")
                 pm_id = line[sep + 1 :].decode("utf-8", errors="ignore")
                 pid = parse_problem_id(pm_id)
-                if pid is not None and ex_id:
+                if (
+                    pid is not None
+                    and ex_id
+                    and (needed_problem_ids is None or pid in needed_problem_ids)
+                ):
                     p2e[pid] = ex_id
+
+    if p2e and not use_problem_json_fallback:
+        print(
+            "[pykt-preprocess] Skipping entities/problem.json fallback; "
+            "relations/exercise-problem.txt already provided mappings",
+            flush=True,
+        )
+        return p2e
 
     json_path = entities_dir / "problem.json"
     if json_path.exists():
+        seen = 0
+        t0 = time.time()
         with open(json_path, "r", encoding="utf-8") as f:
             for line in f:
+                seen += 1
+                if seen % 500_000 == 0:
+                    elapsed = max(time.time() - t0, 1e-6)
+                    print(
+                        "[pykt-preprocess] problem.json fallback {:,} lines ({:,.0f}/s), mappings {:,}".format(
+                            seen, seen / elapsed, len(p2e)
+                        ),
+                        flush=True,
+                    )
                 try:
                     obj = json.loads(line)
                 except json.JSONDecodeError:
@@ -128,7 +167,12 @@ def load_problem_to_exercise(mooc_dir: Path) -> dict[int, str]:
                     pid_raw = obj.get("problem_id")
                 pid = parse_problem_id(pid_raw)
                 exercise_id = obj.get("exercise_id")
-                if pid is not None and exercise_id and pid not in p2e:
+                if (
+                    pid is not None
+                    and exercise_id
+                    and pid not in p2e
+                    and (needed_problem_ids is None or pid in needed_problem_ids)
+                ):
                     p2e[pid] = str(exercise_id)
 
     return p2e
@@ -192,12 +236,11 @@ def hash_split(user_id: str, train_ratio: float, val_ratio: float) -> str:
 
 def first_pass_counts(
     path: Path,
-    p2e: dict[int, str],
     split_map: dict[str, str] | None,
     chunk_size: int,
-) -> tuple[dict[str, int], dict[str, int], int, int]:
-    """Count exercise and user interactions for filtering/top-K."""
-    exercise_counts: dict[str, int] = {}
+) -> tuple[dict[int, int], dict[str, int], int, int]:
+    """Count problem and user interactions before loading large mappings."""
+    problem_counts: dict[int, int] = {}
     user_counts: dict[str, int] = {}
     total = 0
     kept = 0
@@ -226,17 +269,14 @@ def first_pass_counts(
             pid = parse_problem_id(obj.get("problem_id"))
             if pid is None:
                 continue
-            exercise_id = p2e.get(pid)
-            if not exercise_id:
-                continue
-            exercise_counts[exercise_id] = exercise_counts.get(exercise_id, 0) + 1
+            problem_counts[pid] = problem_counts.get(pid, 0) + 1
             user_counts[user_id] = user_counts.get(user_id, 0) + 1
             kept += 1
 
-    return exercise_counts, user_counts, total, kept
+    return problem_counts, user_counts, total, kept
 
 
-def open_writers(output_dir: Path):
+def open_writers(output_dir: Path, write_interactions: bool):
     output_dir.mkdir(parents=True, exist_ok=True)
     fieldnames = [
         "split",
@@ -250,7 +290,10 @@ def open_writers(output_dir: Path):
     ]
     files = {}
     writers = {}
-    for split in ("train", "val", "test", "interactions"):
+    output_files = ["train", "val", "test"]
+    if write_interactions:
+        output_files.append("interactions")
+    for split in output_files:
         f = open(output_dir / f"{split}.csv", "w", encoding="utf-8", newline="")
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -269,10 +312,11 @@ def second_pass_export(
     train_ratio: float,
     val_ratio: float,
     chunk_size: int,
+    write_interactions: bool,
 ) -> dict[str, int]:
     counts = {"train": 0, "val": 0, "test": 0, "skipped": 0}
     order_by_user: dict[str, int] = {}
-    files, writers = open_writers(output_dir)
+    files, writers = open_writers(output_dir, write_interactions)
     total = 0
     t0 = time.time()
     try:
@@ -337,7 +381,8 @@ def second_pass_export(
                     "duration": extract_duration_seconds(obj),
                 }
                 writers[split].writerow(row)
-                writers["interactions"].writerow(row)
+                if write_interactions:
+                    writers["interactions"].writerow(row)
                 counts[split] += 1
     finally:
         for f in files.values():
@@ -360,16 +405,22 @@ def main() -> None:
     parser.add_argument("--min-interactions", type=int, default=3)
     parser.add_argument("--max-concepts", type=int, default=30000)
     parser.add_argument("--chunk-size", type=int, default=5_000_000)
+    parser.add_argument(
+        "--write-interactions",
+        action="store_true",
+        help="Also write data/mooc_pykt/interactions.csv. Not needed by export_mooc_pykt_sequences.py.",
+    )
+    parser.add_argument(
+        "--use-problem-json-fallback",
+        action="store_true",
+        help="Also scan entities/problem.json for missing problem->exercise mappings.",
+    )
     args = parser.parse_args()
 
     problem_path = args.mooc_dir / "relations" / "user-problem.json"
     if not problem_path.exists():
         print(f"[ERROR] Missing {problem_path}", file=sys.stderr)
         sys.exit(1)
-
-    print("[pykt-preprocess] Loading problem -> exercise mapping...")
-    p2e = load_problem_to_exercise(args.mooc_dir)
-    print(f"[pykt-preprocess] Loaded {len(p2e):,} mappings")
 
     split_source = args.split_source
     if split_source == "auto":
@@ -382,15 +433,45 @@ def main() -> None:
     else:
         split_map = load_split_map(args.mooc_dir, split_source)
 
-    print("[pykt-preprocess] Pass 1: counting users and concepts...")
-    exercise_counts, user_counts, total_lines, kept_lines = first_pass_counts(
-        problem_path, p2e, split_map, args.chunk_size
+    print("[pykt-preprocess] Pass 1: counting users and problem ids...")
+    problem_counts, user_counts, total_lines, kept_lines = first_pass_counts(
+        problem_path, split_map, args.chunk_size
     )
+
+    print(
+        "[pykt-preprocess] Pass 1 done: {:,} usable interactions, {:,} users, {:,} problems".format(
+            kept_lines, len(user_counts), len(problem_counts)
+        )
+    )
+    print("[pykt-preprocess] Loading needed problem -> exercise mapping...")
+    p2e = load_problem_to_exercise(
+        args.mooc_dir,
+        args.use_problem_json_fallback,
+        set(problem_counts),
+    )
+    mapped_problem_interactions = 0
+    missing_problem_interactions = 0
+    exercise_counts: dict[str, int] = {}
+    for pid, count in problem_counts.items():
+        exercise_id = p2e.get(pid)
+        if exercise_id:
+            exercise_counts[exercise_id] = exercise_counts.get(exercise_id, 0) + count
+            mapped_problem_interactions += count
+        else:
+            missing_problem_interactions += count
+    del problem_counts
+    print(
+        "[pykt-preprocess] Loaded {:,} needed mappings; mapped interactions {:,}; missing interactions {:,}".format(
+            len(p2e), mapped_problem_interactions, missing_problem_interactions
+        )
+    )
+
     valid_users = {
         user_id
         for user_id, count in user_counts.items()
         if count >= args.min_interactions
     }
+    del user_counts
     if split_map is not None:
         valid_users &= set(split_map)
 
@@ -421,6 +502,7 @@ def main() -> None:
         args.train_ratio,
         args.val_ratio,
         args.chunk_size,
+        args.write_interactions,
     )
 
     meta = {
@@ -430,9 +512,12 @@ def main() -> None:
         "split_source": "sr-dkt" if split_map is not None else "hash",
         "total_lines_seen": total_lines,
         "valid_problem_interactions_pass1": kept_lines,
+        "mapped_problem_interactions": mapped_problem_interactions,
+        "missing_problem_interactions": missing_problem_interactions,
         "valid_users": len(valid_users),
         "num_concepts_raw": len(exercise_counts),
         "max_concepts": args.max_concepts,
+        "write_interactions": args.write_interactions,
         "export_counts": counts,
         "columns": [
             "split",
